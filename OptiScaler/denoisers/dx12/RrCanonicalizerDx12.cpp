@@ -598,7 +598,7 @@ bool CanonicalizerDx12::Compose(ID3D12GraphicsCommandList* commandList, FfxRr12:
             _impl->specularAlbedo.resource.Get(), _impl->motionVectors.resource.Get(),
         };
         std::array<ID3D12Resource*, 1> outputs = { _impl->composedColor.resource.Get() };
-        const CompositionConstants constants { std::min(debugOutput, 7u) };
+        const CompositionConstants constants { std::min(debugOutput, 8u) };
         _impl->composition.Dispatch(commandList, inputs, outputs, _impl->width, _impl->height, &constants,
                                     sizeof(constants));
 

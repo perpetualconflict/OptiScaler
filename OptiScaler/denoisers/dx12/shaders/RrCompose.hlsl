@@ -41,8 +41,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
 
     float4 residual = InResidual[pixel];
-    float3 diffuse = InDiffuse[pixel].rgb * InDiffuseAlbedo[pixel].rgb;
-    float3 specular = InSpecular[pixel].rgb * InSpecularAlbedo[pixel].rgb;
+    float3 diffuseAlbedo = InDiffuseAlbedo[pixel].rgb;
+    float3 specularAlbedo = InSpecularAlbedo[pixel].rgb;
+    float3 diffuse = InDiffuse[pixel].rgb * diffuseAlbedo;
+    float3 specular = InSpecular[pixel].rgb * specularAlbedo;
+    float3 noisyDiffuse = InNoisyDiffuse[pixel].rgb * diffuseAlbedo;
+    float3 noisySpecular = InNoisySpecular[pixel].rgb * specularAlbedo;
+    float3 currentColor = noisyDiffuse + noisySpecular + residual.rgb;
     float3 color = diffuse + specular + residual.rgb;
     if (DebugOutput == 1)
         color = diffuse;
@@ -51,9 +56,9 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     else if (DebugOutput == 3)
         color = residual.rgb;
     else if (DebugOutput == 4)
-        color = InNoisyDiffuse[pixel].rgb * InDiffuseAlbedo[pixel].rgb;
+        color = noisyDiffuse;
     else if (DebugOutput == 5)
-        color = InNoisySpecular[pixel].rgb * InSpecularAlbedo[pixel].rgb;
+        color = noisySpecular;
     else if (DebugOutput == 6)
     {
         float2 motionPixels = InMotion[pixel].xy * float2(width, height);
@@ -72,6 +77,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         float3 deltaTint = depthDelta >= 0.0f ? float3(1.0f, 0.05f, 0.05f) : float3(0.05f, 0.25f, 1.0f);
         float deltaMagnitude = log2(1.0f + abs(depthDelta)) * 0.5f;
         color = DiagnosticOverlay(color, deltaTint, deltaMagnitude);
+    }
+    else if (DebugOutput == 8)
+    {
+        // Match the depth-delta overlay's replacement strength so this is a causal A/B: pixels that
+        // were diagnostic tint in mode 7 instead receive the non-temporal, reconstructed current color.
+        float depthRisk = saturate(log2(1.0f + abs(InMotion[pixel].z)) * 0.5f);
+        color = lerp(color, currentColor, 0.85f * depthRisk);
     }
     OutColor[pixel] = float4(max(color, 0.0f), residual.a);
 }

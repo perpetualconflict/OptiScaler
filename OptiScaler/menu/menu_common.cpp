@@ -3004,8 +3004,9 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
             "Noisy Specular",
             "Motion Vectors",
             "Depth Delta",
+            "Depth-Risk Current Color",
         };
-        int debugOutput = std::clamp(config->FSRRDebugOutput.value_or_default(), 0, 7);
+        int debugOutput = std::clamp(config->FSRRDebugOutput.value_or_default(), 0, 8);
         ImGui::SetNextItemWidth(190.0f * menuResScale);
         if (ImGui::Combo("Debug Output", &debugOutput, debugOutputs, IM_ARRAYSIZE(debugOutputs)))
             config->FSRRDebugOutput = debugOutput;

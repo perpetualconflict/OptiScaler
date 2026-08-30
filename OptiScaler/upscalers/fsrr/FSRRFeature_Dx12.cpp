@@ -559,7 +559,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             else if (!_impl->canonicalizer->Compose(
                          commandList, _impl->profile->signals,
                          static_cast<uint32_t>(std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(),
-                                                          0, 7))))
+                                                          0, 8))))
                 _impl->FailOnce(&snapshot, "composition failed: " + _impl->canonicalizer->LastError());
             else
                 rrSucceeded = true;
@@ -581,7 +581,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             "FSR-RR first active dispatch succeeded: handle={}, frame={}, render={}x{}, "
             "signals=direct_diffuse|indirect_specular, debug_output={}",
             Handle()->Id, snapshot.frameIndex, snapshot.renderWidth, snapshot.renderHeight,
-            std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 7));
+            std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 8));
         _impl->loggedFirstDispatch = true;
     }
 
