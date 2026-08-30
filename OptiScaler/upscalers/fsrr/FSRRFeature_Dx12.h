@@ -15,8 +15,11 @@ class FSRRFeatureDx12 final : public FSR2FeatureDx12_212
 
     feature_version Version() override { return { 1, 2, 0 }; }
     Upscaler GetUpscalerType() const override { return Upscaler::DLSSD; }
+    bool AutoExposure() override { return true; }
 
   private:
+    bool EvaluateFallback(ID3D12GraphicsCommandList* commandList, NVSDK_NGX_Parameter* parameters);
+
     struct Impl;
     std::unique_ptr<Impl> _impl;
 };

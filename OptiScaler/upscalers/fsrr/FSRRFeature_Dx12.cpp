@@ -211,8 +211,26 @@ FSRRFeatureDx12::FSRRFeatureDx12(unsigned int handleId, NVSDK_NGX_Parameter* par
 
 FSRRFeatureDx12::~FSRRFeatureDx12() = default;
 
+bool FSRRFeatureDx12::EvaluateFallback(ID3D12GraphicsCommandList* commandList,
+                                      NVSDK_NGX_Parameter* parameters)
+{
+    const bool result = FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+
+    auto& changeRequested = State::Instance().changeBackend[Handle()->Id];
+    if (changeRequested)
+    {
+        LOG_WARN("FSR-RR ignored a backend replacement requested by its private FSR 2.1.2 fallback");
+        changeRequested = false;
+    }
+
+    return result;
+}
+
 bool FSRRFeatureDx12::InitInternal(ID3D12GraphicsCommandList* commandList, NVSDK_NGX_Parameter* parameters)
 {
+    if (!IFeature::AutoExposure())
+        LOG_INFO("FSR-RR is forcing auto exposure for its private FSR 2.1.2 fallback context");
+
     if (!FSR2FeatureDx12_212::InitInternal(commandList, parameters))
         return false;
 
@@ -292,7 +310,7 @@ bool FSRRFeatureDx12::InitInternal(ID3D12GraphicsCommandList* commandList, NVSDK
 bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, NVSDK_NGX_Parameter* parameters)
 {
     if (!_impl->bridgeReady && !_impl->captureOnly)
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
 
     const auto snapshot = CaptureInputs(Handle()->Id, static_cast<uint32_t>(_frameCount), *parameters);
     if (Config::Instance()->FSRRLogInputs.value_or_default() &&
@@ -307,7 +325,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     if (validation.HasErrors())
     {
         _impl->FailOnce(&snapshot, validation.Summary());
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
     }
     const std::string warningKey = validation.Summary() + snapshot.Signature();
     if (!validation.issues.empty() && warningKey != _impl->lastWarningKey)
@@ -321,7 +339,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     if (_impl->captureOnly)
     {
         _impl->lastFailureKey.clear();
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
     }
 
     std::string reason;
@@ -334,19 +352,19 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     if (!color || !depth || !motion || !normals || !diffuseAlbedo || !specularAlbedo)
     {
         _impl->FailOnce(&snapshot, reason);
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
     }
 
     if (!snapshot.depthType ||
         (*snapshot.depthType == 1) != (_impl->profile->depthConvention == DepthConvention::Hardware))
     {
         _impl->FailOnce(&snapshot, "DLSS depth metadata disagrees with the executable profile");
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
     }
     if (!snapshot.roughnessMode)
     {
         _impl->FailOnce(&snapshot, "DLSS roughness mode is missing");
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
     }
 
     const bool packedRoughness = *snapshot.roughnessMode == 1;
@@ -354,7 +372,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     if (!packedRoughness && !roughness)
     {
         _impl->FailOnce(&snapshot, "unpacked roughness mode requires GBuffer.Roughness");
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
     }
 
     const auto currentView = ConvertMatrix(snapshot.worldToView, _impl->profile->matrixConversion);
@@ -364,7 +382,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     if (!Invert(currentView, inverseView) || !Invert(currentProjection, inverseProjection))
     {
         _impl->FailOnce(&snapshot, "camera matrices are singular or non-finite");
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
     }
 
     if (!_impl->contextReady || _impl->contextWidth != snapshot.renderWidth ||
@@ -375,7 +393,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         if (!_impl->canonicalizer->Resize(snapshot.renderWidth, snapshot.renderHeight))
         {
             _impl->FailOnce(&snapshot, "canonical resource resize failed: " + _impl->canonicalizer->LastError());
-            return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+            return EvaluateFallback(commandList, parameters);
         }
 
         FfxRr12::ContextDescription contextDescription;
@@ -388,7 +406,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         if (!_impl->provider.CreateContext(contextDescription))
         {
             _impl->FailOnce(&snapshot, "context creation failed: " + _impl->provider.LastError());
-            return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+            return EvaluateFallback(commandList, parameters);
         }
 
         _impl->contextReady = true;
@@ -426,7 +444,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         !specularHitDistance->IsPresent())
     {
         _impl->FailOnce(&snapshot, "the indirect-signal adapter requires diffuse and specular hit-distance inputs");
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
     }
 
     {
@@ -559,7 +577,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     }
 
     if (!rrSucceeded)
-        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+        return EvaluateFallback(commandList, parameters);
 
     _impl->previousView = currentView;
     _impl->previousCamera = currentCamera;
