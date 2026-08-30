@@ -22,7 +22,7 @@ class FSR2FeatureDx12_212 : public FSR2Feature212, public IFeature_Dx12
     bool EvaluateInternal(ID3D12GraphicsCommandList* InCommandList, NVSDK_NGX_Parameter* InParameters) override;
 
     feature_version Version() override { return FSR2Feature212::Version(); }
-    Upscaler GetUpscalerType() const final { return Upscaler::FSR21; }
+    Upscaler GetUpscalerType() const override { return Upscaler::FSR21; }
     API Api() const override { return IFeature_Dx12::Api(); }
     bool CallsUpscalerEndByItself() override { return IFeature_Dx12::CallsUpscalerEndByItself(); }
 
