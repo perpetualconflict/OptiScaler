@@ -20,6 +20,15 @@ cbuffer Constants : register(b0)
     uint3 Padding;
 };
 
+float3 DiagnosticOverlay(float3 sceneColor, float3 diagnosticTint, float amount)
+{
+    static const float3 LuminanceWeights = float3(0.2126f, 0.7152f, 0.0722f);
+    float sceneLuminance = dot(max(sceneColor, 0.0f), LuminanceWeights);
+    float tintLuminance = max(dot(diagnosticTint, LuminanceWeights), 0.001f);
+    float3 luminanceMatchedTint = diagnosticTint * (max(sceneLuminance, 0.02f) / tintLuminance);
+    return lerp(sceneColor, luminanceMatchedTint, 0.85f * saturate(amount));
+}
+
 [RootSignature(MainRS)]
 [numthreads(8, 8, 1)]
 void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
@@ -48,12 +57,21 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     else if (DebugOutput == 6)
     {
         float2 motionPixels = InMotion[pixel].xy * float2(width, height);
-        color = float3(0.5f + 0.05f * motionPixels.x, 0.5f + 0.05f * motionPixels.y, 0.5f);
+        float motionLength = length(motionPixels);
+        float2 direction = motionPixels / max(motionLength, 0.0001f);
+        float3 horizontalTint = direction.x >= 0.0f ? float3(1.0f, 0.05f, 0.05f) : float3(0.05f, 1.0f, 1.0f);
+        float3 verticalTint = direction.y >= 0.0f ? float3(0.05f, 1.0f, 0.05f) : float3(1.0f, 0.05f, 1.0f);
+        float directionWeight = max(abs(direction.x) + abs(direction.y), 0.0001f);
+        float3 directionTint =
+            (abs(direction.x) * horizontalTint + abs(direction.y) * verticalTint) / directionWeight;
+        color = DiagnosticOverlay(color, directionTint, motionLength * 0.5f);
     }
     else if (DebugOutput == 7)
     {
         float depthDelta = InMotion[pixel].z;
-        color = float3(0.5f + 0.1f * depthDelta, 0.5f - 0.1f * depthDelta, 0.5f);
+        float3 deltaTint = depthDelta >= 0.0f ? float3(1.0f, 0.05f, 0.05f) : float3(0.05f, 0.25f, 1.0f);
+        float deltaMagnitude = log2(1.0f + abs(depthDelta)) * 0.5f;
+        color = DiagnosticOverlay(color, deltaTint, deltaMagnitude);
     }
     OutColor[pixel] = float4(max(color, 0.0f), residual.a);
 }
