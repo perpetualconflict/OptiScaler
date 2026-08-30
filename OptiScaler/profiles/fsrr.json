@@ -11,11 +11,11 @@
       "depth_convention": "hardware",
       "motion_vector_direction": "previous_minus_current",
       "signal_adapter": "composite_albedo_split",
-      "signals": ["indirect_diffuse", "indirect_specular"],
+      "signals": ["direct_diffuse", "indirect_specular"],
       "checkerboard_signals": [],
       "linear_depth_min": 0.01,
       "linear_depth_max": 10000.0,
-      "notes": "Seeded from OptiScaler_Test behavior, but deliberately disabled until the 1.2 signal classification, hit-distance semantics, and albedo-weighted composition output are capture-validated."
+      "notes": "The proof's no-distance diffuse channel maps to FSR-RR 1.2 direct diffuse; its specular channel remains indirect and uses Cyberpunk's specular hit distance. Deliberately disabled until the active adapter is capture-validated."
     }
   ]
 }

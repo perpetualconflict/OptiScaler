@@ -25,7 +25,7 @@ using namespace DirectX;
 using namespace RayReconstruction;
 
 constexpr auto RequiredCompositeSignals =
-    FfxRr12::ToMask(FfxRr12::Signal::IndirectDiffuse) |
+    FfxRr12::ToMask(FfxRr12::Signal::DirectDiffuse) |
     FfxRr12::ToMask(FfxRr12::Signal::IndirectSpecular);
 
 const ResourceInput* Required(const InputSnapshot& snapshot, InputSemantic semantic, std::string& reason)
@@ -426,13 +426,6 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
                                _impl->previousCamera.z - currentCamera.z }
             : FfxRr12::Float3 {};
 
-    const auto* diffuseHitDistance = OptionalUsable(snapshot, InputSemantic::DiffuseRayDirectionHitDistance);
-    bool diffuseHitInAlpha = diffuseHitDistance != nullptr;
-    if (!diffuseHitDistance)
-    {
-        diffuseHitDistance = OptionalUsable(snapshot, InputSemantic::DiffuseHitDistance);
-        diffuseHitInAlpha = false;
-    }
     const auto* specularHitDistance = OptionalUsable(snapshot, InputSemantic::SpecularRayDirectionHitDistance);
     bool specularHitInAlpha = specularHitDistance != nullptr;
     if (!specularHitDistance)
@@ -440,10 +433,9 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         specularHitDistance = OptionalUsable(snapshot, InputSemantic::SpecularHitDistance);
         specularHitInAlpha = false;
     }
-    if (!diffuseHitDistance || !diffuseHitDistance->IsPresent() || !specularHitDistance ||
-        !specularHitDistance->IsPresent())
+    if (!specularHitDistance || !specularHitDistance->IsPresent())
     {
-        _impl->FailOnce(&snapshot, "the indirect-signal adapter requires diffuse and specular hit-distance inputs");
+        _impl->FailOnce(&snapshot, "the composite adapter requires a specular hit-distance input");
         return EvaluateFallback(commandList, parameters);
     }
 
@@ -475,7 +467,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             packedRoughness ? nullptr : roughness,
             diffuseAlbedo,
             specularAlbedo,
-            diffuseHitDistance,
+            nullptr,
             specularHitDistance,
         };
         for (size_t index = 0; index < canonicalInputs.size(); ++index)
@@ -496,13 +488,6 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         if (_impl->hasPreviousCamera && !_impl->resetHistory && snapshot.reset == 0)
             conversion.flags |= ToFlag(CanonicalizationFlag::HasPreviousLinearDepth);
 
-        if (diffuseHitDistance && diffuseHitDistance->IsPresent())
-        {
-            conversion.diffuseHitDistance = diffuseHitDistance->resource;
-            conversion.flags |= ToFlag(CanonicalizationFlag::HasDiffuseHitDistance);
-            if (diffuseHitInAlpha)
-                conversion.flags |= ToFlag(CanonicalizationFlag::DiffuseHitDistanceInAlpha);
-        }
         if (specularHitDistance && specularHitDistance->IsPresent())
         {
             conversion.specularHitDistance = specularHitDistance->resource;
@@ -520,14 +505,14 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         {
             std::array<FfxRr12::SignalDescription, 2> signals = {
                 FfxRr12::SignalDescription {
-                    .type = FfxRr12::Signal::IndirectDiffuse,
-                    .input = { _impl->canonicalizer->SignalInput(FfxRr12::Signal::IndirectDiffuse),
+                    .type = FfxRr12::Signal::DirectDiffuse,
+                    .input = { _impl->canonicalizer->SignalInput(FfxRr12::Signal::DirectDiffuse),
                                FfxRr12::ResourceState::ComputeRead },
-                    .output = { _impl->canonicalizer->SignalOutput(FfxRr12::Signal::IndirectDiffuse),
+                    .output = { _impl->canonicalizer->SignalOutput(FfxRr12::Signal::DirectDiffuse),
                                 FfxRr12::ResourceState::UnorderedAccess },
                     .checkerboardOrigin =
                         (_impl->profile->checkerboardSignals &
-                         FfxRr12::ToMask(FfxRr12::Signal::IndirectDiffuse))
+                         FfxRr12::ToMask(FfxRr12::Signal::DirectDiffuse))
                             ? (snapshot.frameIndex & 1u)
                             : 0u,
                 },

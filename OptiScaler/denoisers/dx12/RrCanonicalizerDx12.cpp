@@ -384,7 +384,7 @@ CanonicalizerDx12::CanonicalizerDx12(ID3D12Device* device) : _impl(std::make_uni
         _impl->conversion.Initialize(device, RrCanonicalize_cso, sizeof(RrCanonicalize_cso),
                                      sizeof(ConversionConstants), 10, 8, L"FSRR_CanonicalConstants");
         _impl->composition.Initialize(device, RrCompose_cso, sizeof(RrCompose_cso),
-                                      sizeof(CompositionConstants), 5, 1, L"FSRR_CompositionConstants");
+                                      sizeof(CompositionConstants), 7, 1, L"FSRR_CompositionConstants");
         _impl->ready = true;
     }
     catch (const std::exception& exception)
@@ -509,11 +509,11 @@ bool CanonicalizerDx12::Convert(const CanonicalizationDescription& description)
         for (auto* input : inputs)
             ValidateShaderResource(_impl->device, input);
 
-        auto& indirectDiffuse = _impl->signalInputs[SignalIndex(FfxRr12::Signal::IndirectDiffuse)];
+        auto& directDiffuse = _impl->signalInputs[SignalIndex(FfxRr12::Signal::DirectDiffuse)];
         auto& indirectSpecular = _impl->signalInputs[SignalIndex(FfxRr12::Signal::IndirectSpecular)];
         std::array<Texture*, 8> outputTextures = {
             &_impl->linearDepth[_impl->depthWriteIndex], &_impl->motionVectors, &_impl->normals, &_impl->diffuseAlbedo,
-            &_impl->specularAlbedo, &indirectDiffuse, &indirectSpecular, &_impl->residual,
+            &_impl->specularAlbedo, &directDiffuse, &indirectSpecular, &_impl->residual,
         };
         std::array<ID3D12Resource*, 8> outputs {};
         for (size_t index = 0; index < outputTextures.size(); ++index)
@@ -574,27 +574,28 @@ bool CanonicalizerDx12::PrepareSignalOutputs(ID3D12GraphicsCommandList* commandL
 bool CanonicalizerDx12::Compose(ID3D12GraphicsCommandList* commandList, FfxRr12::SignalMask signals,
                                 uint32_t debugOutput)
 {
-    const auto supportedSignals = FfxRr12::ToMask(FfxRr12::Signal::IndirectDiffuse) |
+    const auto supportedSignals = FfxRr12::ToMask(FfxRr12::Signal::DirectDiffuse) |
                                   FfxRr12::ToMask(FfxRr12::Signal::IndirectSpecular);
     if (!commandList || signals != supportedSignals)
     {
-        _impl->lastError = "the current composition adapter requires indirect diffuse and indirect specular";
+        _impl->lastError = "the current composition adapter requires direct diffuse and indirect specular";
         return false;
     }
 
     try
     {
-        auto& diffuse = _impl->signalOutputs[SignalIndex(FfxRr12::Signal::IndirectDiffuse)];
+        auto& diffuse = _impl->signalOutputs[SignalIndex(FfxRr12::Signal::DirectDiffuse)];
         auto& specular = _impl->signalOutputs[SignalIndex(FfxRr12::Signal::IndirectSpecular)];
-        auto& noisyDiffuse = _impl->signalInputs[SignalIndex(FfxRr12::Signal::IndirectDiffuse)];
+        auto& noisyDiffuse = _impl->signalInputs[SignalIndex(FfxRr12::Signal::DirectDiffuse)];
         auto& noisySpecular = _impl->signalInputs[SignalIndex(FfxRr12::Signal::IndirectSpecular)];
         Transition(commandList, diffuse.resource.Get(), diffuse.state, ComputeRead);
         Transition(commandList, specular.resource.Get(), specular.state, ComputeRead);
         Transition(commandList, _impl->composedColor.resource.Get(), _impl->composedColor.state, UnorderedAccess);
 
-        std::array<ID3D12Resource*, 5> inputs = {
+        std::array<ID3D12Resource*, 7> inputs = {
             diffuse.resource.Get(), specular.resource.Get(), _impl->residual.resource.Get(),
-            noisyDiffuse.resource.Get(), noisySpecular.resource.Get(),
+            noisyDiffuse.resource.Get(), noisySpecular.resource.Get(), _impl->diffuseAlbedo.resource.Get(),
+            _impl->specularAlbedo.resource.Get(),
         };
         std::array<ID3D12Resource*, 1> outputs = { _impl->composedColor.resource.Get() };
         const CompositionConstants constants { std::min(debugOutput, 5u) };

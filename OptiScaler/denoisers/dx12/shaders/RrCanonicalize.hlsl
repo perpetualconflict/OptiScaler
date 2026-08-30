@@ -23,7 +23,7 @@ RWTexture2D<float4> OutMotion : register(u1);
 RWTexture2D<float4> OutNormals : register(u2);
 RWTexture2D<float4> OutDiffuseAlbedo : register(u3);
 RWTexture2D<float4> OutSpecularAlbedo : register(u4);
-RWTexture2D<float4> OutIndirectDiffuse : register(u5);
+RWTexture2D<float4> OutDirectDiffuse : register(u5);
 RWTexture2D<float4> OutIndirectSpecular : register(u6);
 RWTexture2D<float4> OutResidual : register(u7);
 
@@ -164,34 +164,40 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     bool albedoValid = all(isfinite(diffuseAlbedoSample)) && all(isfinite(specularAlbedoSample));
     float3 diffuseAlbedo = albedoValid ? max(diffuseAlbedoSample, 0.0f) : 0.0f;
     float3 specularAlbedo = albedoValid ? max(specularAlbedoSample, 0.0f) : 0.0f;
-    OutDiffuseAlbedo[pixel] = float4(saturate(diffuseAlbedo), 0.0f);
-    OutSpecularAlbedo[pixel] = float4(saturate(specularAlbedo), 0.0f);
+
+    // DLSS-RR supplies diffuse albedo and hemispherical specular reflectance. Keep their sum bounded so
+    // demodulation remains stable and the same values can be used to recompose FSR-RR's illumination.
+    float3 albedoOvershoot = max(diffuseAlbedo + specularAlbedo - 1.0f, 0.0f);
+    specularAlbedo = saturate(specularAlbedo - albedoOvershoot);
+    diffuseAlbedo = saturate(diffuseAlbedo - max(diffuseAlbedo + specularAlbedo - 1.0f, 0.0f));
+    OutDiffuseAlbedo[pixel] = float4(diffuseAlbedo, 0.0f);
+    OutSpecularAlbedo[pixel] = float4(specularAlbedo, 0.0f);
 
     float3 totalAlbedo = diffuseAlbedo + specularAlbedo;
     bool splitValid = rawValid && depthValid && motionValid && normalValid && roughnessValid && albedoValid &&
                       any(totalAlbedo > 1e-4f);
     float3 safeTotalAlbedo = max(totalAlbedo, 1e-4f);
     float3 specularWeight = splitValid ? saturate(specularAlbedo / safeTotalAlbedo) : 0.0f;
-    float3 specularRadiance = splitValid ? max(raw.rgb, 0.0f) * specularWeight : 0.0f;
-    float3 diffuseRadiance = splitValid ? max(raw.rgb, 0.0f) - specularRadiance : 0.0f;
+    float3 positiveRaw = max(raw.rgb, 0.0f);
+    float3 specularColor = splitValid ? positiveRaw * specularWeight : 0.0f;
+    float3 diffuseColor = splitValid ? positiveRaw - specularColor : 0.0f;
+    float3 specularIllumination = splitValid ? specularColor / max(specularAlbedo, 1e-4f) : 0.0f;
+    float3 diffuseIllumination = splitValid ? diffuseColor / max(diffuseAlbedo, 1e-4f) : 0.0f;
+    specularIllumination = min(specularIllumination, 65504.0f);
+    diffuseIllumination = min(diffuseIllumination, 65504.0f);
 
-    float4 diffuseHitSample = InDiffuseHitDistance[diffuseHitPixel];
     float4 specularHitSample = InSpecularHitDistance[specularHitPixel];
-    float diffuseHitDistance = (Flags & FlagHasDiffuseHitDistance) != 0
-                                   ? ((Flags & FlagDiffuseHitDistanceInAlpha) != 0
-                                          ? diffuseHitSample.a
-                                          : diffuseHitSample.r)
-                                   : -1.0f;
     float specularHitDistance = (Flags & FlagHasSpecularHitDistance) != 0
                                     ? ((Flags & FlagSpecularHitDistanceInAlpha) != 0
                                            ? specularHitSample.a
                                            : specularHitSample.r)
                                     : -1.0f;
-    if (!splitValid || !isfinite(diffuseHitDistance))
-        diffuseHitDistance = -1.0f;
     if (!splitValid || !isfinite(specularHitDistance))
         specularHitDistance = -1.0f;
-    OutIndirectDiffuse[pixel] = float4(diffuseRadiance, diffuseHitDistance);
-    OutIndirectSpecular[pixel] = float4(specularRadiance, specularHitDistance);
-    OutResidual[pixel] = float4(raw.rgb - diffuseRadiance - specularRadiance, raw.a);
+    float directDiffuseValidity = splitValid ? 0.0f : -1.0f;
+    OutDirectDiffuse[pixel] = float4(diffuseIllumination, directDiffuseValidity);
+    OutIndirectSpecular[pixel] = float4(specularIllumination, specularHitDistance);
+
+    float3 remodulated = diffuseIllumination * diffuseAlbedo + specularIllumination * specularAlbedo;
+    OutResidual[pixel] = float4(raw.rgb - remodulated, raw.a);
 }

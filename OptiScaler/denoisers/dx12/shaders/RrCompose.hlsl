@@ -1,7 +1,7 @@
 #define MainRS \
     "RootFlags(0)," \
     "CBV(b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors = 5))," \
+    "DescriptorTable(SRV(t0, numDescriptors = 7))," \
     "DescriptorTable(UAV(u0, numDescriptors = 1))"
 
 Texture2D<float4> InDiffuse : register(t0);
@@ -9,6 +9,8 @@ Texture2D<float4> InSpecular : register(t1);
 Texture2D<float4> InResidual : register(t2);
 Texture2D<float4> InNoisyDiffuse : register(t3);
 Texture2D<float4> InNoisySpecular : register(t4);
+Texture2D<float4> InDiffuseAlbedo : register(t5);
+Texture2D<float4> InSpecularAlbedo : register(t6);
 RWTexture2D<float4> OutColor : register(u0);
 
 cbuffer Constants : register(b0)
@@ -29,8 +31,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         return;
 
     float4 residual = InResidual[pixel];
-    float3 diffuse = InDiffuse[pixel].rgb;
-    float3 specular = InSpecular[pixel].rgb;
+    float3 diffuse = InDiffuse[pixel].rgb * InDiffuseAlbedo[pixel].rgb;
+    float3 specular = InSpecular[pixel].rgb * InSpecularAlbedo[pixel].rgb;
     float3 color = diffuse + specular + residual.rgb;
     if (DebugOutput == 1)
         color = diffuse;
@@ -39,8 +41,8 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     else if (DebugOutput == 3)
         color = residual.rgb;
     else if (DebugOutput == 4)
-        color = InNoisyDiffuse[pixel].rgb;
+        color = InNoisyDiffuse[pixel].rgb * InDiffuseAlbedo[pixel].rgb;
     else if (DebugOutput == 5)
-        color = InNoisySpecular[pixel].rgb;
+        color = InNoisySpecular[pixel].rgb * InSpecularAlbedo[pixel].rgb;
     OutColor[pixel] = float4(max(color, 0.0f), residual.a);
 }
