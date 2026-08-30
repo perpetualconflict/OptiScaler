@@ -54,6 +54,15 @@ MotionVectorDirection ParseMotionDirection(const std::string& value)
     return MotionVectorDirection::Unspecified;
 }
 
+DepthDeltaSource ParseDepthDeltaSource(const std::string& value)
+{
+    if (value == "reprojected_history")
+        return DepthDeltaSource::ReprojectedHistory;
+    if (value == "camera_reprojection")
+        return DepthDeltaSource::CameraReprojection;
+    return DepthDeltaSource::Unspecified;
+}
+
 SignalAdapter ParseSignalAdapter(const std::string& value)
 {
     if (value == "composite_floor_split")
@@ -112,6 +121,8 @@ bool Profile::IsDispatchable(std::string& reason) const
         reason = "depth convention is unspecified";
     else if (motionVectorDirection == MotionVectorDirection::Unspecified)
         reason = "motion-vector direction is unspecified";
+    else if (depthDeltaSource == DepthDeltaSource::Unspecified)
+        reason = "depth-delta source is unspecified";
     else if (signalAdapter == SignalAdapter::Disabled || signals == 0)
         reason = "no signal adapter or signal mask is enabled";
     else if ((checkerboardSignals & ~signals) != 0)
@@ -155,6 +166,8 @@ bool ProfileDatabase::Load(const std::filesystem::path& path)
             profile.depthConvention = ParseDepthConvention(Lower(value.value("depth_convention", "unspecified")));
             profile.motionVectorDirection =
                 ParseMotionDirection(Lower(value.value("motion_vector_direction", "unspecified")));
+            profile.depthDeltaSource =
+                ParseDepthDeltaSource(Lower(value.value("depth_delta_source", "unspecified")));
             profile.signalAdapter = ParseSignalAdapter(Lower(value.value("signal_adapter", "disabled")));
             profile.signals = ParseSignalMask(value.value("signals", nlohmann::json::array()));
             profile.checkerboardSignals =

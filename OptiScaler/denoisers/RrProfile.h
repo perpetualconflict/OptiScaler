@@ -37,6 +37,13 @@ enum class MotionVectorDirection : uint8_t
     CurrentMinusPrevious,
 };
 
+enum class DepthDeltaSource : uint8_t
+{
+    Unspecified,
+    ReprojectedHistory,
+    CameraReprojection,
+};
+
 enum class SignalAdapter : uint8_t
 {
     Disabled,
@@ -55,6 +62,7 @@ struct Profile
     MatrixConversion matrixConversion = MatrixConversion::Unspecified;
     DepthConvention depthConvention = DepthConvention::Unspecified;
     MotionVectorDirection motionVectorDirection = MotionVectorDirection::Unspecified;
+    DepthDeltaSource depthDeltaSource = DepthDeltaSource::Unspecified;
     SignalAdapter signalAdapter = SignalAdapter::Disabled;
     FfxRr12::SignalMask signals = 0;
     FfxRr12::SignalMask checkerboardSignals = 0;

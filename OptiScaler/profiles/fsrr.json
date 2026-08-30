@@ -10,6 +10,7 @@
       "matrix_conversion": "direct_copy",
       "depth_convention": "hardware",
       "motion_vector_direction": "previous_minus_current",
+      "depth_delta_source": "reprojected_history",
       "signal_adapter": "composite_albedo_split",
       "signals": ["direct_diffuse", "indirect_specular"],
       "checkerboard_signals": [],

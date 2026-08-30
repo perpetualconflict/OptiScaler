@@ -300,8 +300,11 @@ bool FSRRFeatureDx12::InitInternal(ID3D12GraphicsCommandList* commandList, NVSDK
     }
 
     const auto& version = _impl->provider.SelectedVersion();
-    LOG_INFO("FSR-RR bridge armed with provider {}.{}.{} ({}) and profile '{}'", version.major, version.minor,
-             version.patch, version.name, _impl->profile->id);
+    const auto depthDeltaSource =
+        _impl->profile->depthDeltaSource == DepthDeltaSource::ReprojectedHistory ? "reprojected_history"
+                                                                                : "camera_reprojection";
+    LOG_INFO("FSR-RR bridge armed with provider {}.{}.{} ({}) and profile '{}' (depth_delta_source={})",
+             version.major, version.minor, version.patch, version.name, _impl->profile->id, depthDeltaSource);
     parameters->Set("SuperSamplingDenoising.Available", 1);
     parameters->Set("SuperSamplingDenoising.FeatureInitResult", static_cast<uint32_t>(NVSDK_NGX_Result_Success));
     _impl->bridgeReady = true;
@@ -486,7 +489,8 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             conversion.flags |= ToFlag(CanonicalizationFlag::ViewSpaceNormals);
         if (_impl->profile->motionVectorDirection == MotionVectorDirection::CurrentMinusPrevious)
             conversion.flags |= ToFlag(CanonicalizationFlag::FlipMotionVectors);
-        if (_impl->hasPreviousCamera && !_impl->resetHistory && snapshot.reset == 0)
+        if (_impl->profile->depthDeltaSource == DepthDeltaSource::ReprojectedHistory &&
+            _impl->hasPreviousCamera && !_impl->resetHistory && snapshot.reset == 0)
             conversion.flags |= ToFlag(CanonicalizationFlag::HasPreviousLinearDepth);
 
         if (specularHitDistance && specularHitDistance->IsPresent())
