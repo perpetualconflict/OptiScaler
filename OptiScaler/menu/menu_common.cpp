@@ -2955,6 +2955,68 @@ void MenuCommon::RenderActiveUpscalerSettings(RenderMenuContext& ctx)
     }
 }
 
+void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
+{
+    auto config = ctx.config;
+    auto& menuResScale = ctx.menuResScale;
+
+    ImGui::Spacing();
+    if (auto ch = ScopedCollapsingHeader("FSR Ray Regeneration (Experimental)"); ch.IsHeaderOpen())
+    {
+        ScopedIndent indent {};
+        ImGui::Spacing();
+
+        bool enabled = config->FSRREnabled.value_or_default();
+        if (ImGui::Checkbox("Enable FSR-RR Bridge", &enabled))
+            config->FSRREnabled = enabled;
+        ShowHelpMarker("Expose NVIDIA DLSS Ray Reconstruction through the experimental AMD FSR-RR bridge.\n"
+                       "Save settings and restart the game after changing this option.");
+
+        ImGui::BeginDisabled(!enabled);
+
+        bool captureOnly = config->FSRRCaptureOnly.value_or_default();
+        if (ImGui::Checkbox("Capture Inputs Only", &captureOnly))
+            config->FSRRCaptureOnly = captureOnly;
+        ShowHelpMarker("Safe validation mode: advertise Ray Reconstruction and log normalized inputs,\n"
+                       "but never create or dispatch the AMD denoiser. FSR 2.1.2 remains the output path.\n"
+                       "Save settings and restart the game after changing this option.");
+
+        bool logInputs = config->FSRRLogInputs.value_or_default();
+        if (ImGui::Checkbox("Log Normalized Inputs", &logInputs))
+            config->FSRRLogInputs = logInputs;
+        ShowHelpMarker("Log resource formats, extents, subrects, matrices, jitter, motion scale,\n"
+                       "and other DLSS-D metadata whenever the input layout changes.");
+
+        ImGui::BeginDisabled(captureOnly);
+
+        bool validation = config->FSRRDebugValidation.value_or_default();
+        if (ImGui::Checkbox("AMD Provider Validation", &validation))
+            config->FSRRDebugValidation = validation;
+        ShowHelpMarker("Enable the FidelityFX provider validation and debugging layers.\n"
+                       "This applies when a Ray Regeneration context is next created.");
+
+        static constexpr const char* debugOutputs[] = {
+            "Recomposed Result",
+            "Denoised Diffuse",
+            "Denoised Specular",
+            "Residual / Skipped Color",
+            "Noisy Diffuse",
+            "Noisy Specular",
+        };
+        int debugOutput = std::clamp(config->FSRRDebugOutput.value_or_default(), 0, 5);
+        ImGui::SetNextItemWidth(190.0f * menuResScale);
+        if (ImGui::Combo("Debug Output", &debugOutput, debugOutputs, IM_ARRAYSIZE(debugOutputs)))
+            config->FSRRDebugOutput = debugOutput;
+        ShowHelpMarker("Select which intermediate image is sent through the upscaler.\n"
+                       "Only applies when capture-only mode is disabled and FSR-RR dispatch succeeds.");
+
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+
+        ImGui::Spacing();
+    }
+}
+
 void MenuCommon::RenderFrameGenerationSelection(RenderMenuContext& ctx)
 {
     auto& state = ctx.state;
@@ -6897,6 +6959,7 @@ void MenuCommon::RenderMainMenuTable(RenderMenuContext& ctx)
 
         // Left column: active upscaler state, frame generation, FSR common, latency and fakenvapi controls.
         RenderActiveUpscalerSettings(ctx);
+        RenderFsrRayRegenerationSettings(ctx);
         RenderFrameGenerationSelection(ctx);
         RenderFrameGenerationRuntimeSettings(ctx);
         RenderFsrCommonSettings(ctx);
