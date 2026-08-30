@@ -180,6 +180,7 @@ struct FSRRFeatureDx12::Impl
     const Profile* profile = nullptr;
     std::unique_ptr<CanonicalizerDx12> canonicalizer;
     bool bridgeReady = false;
+    bool captureOnly = false;
     bool contextReady = false;
     bool resetHistory = true;
     bool hasPreviousCamera = false;
@@ -223,6 +224,16 @@ bool FSRRFeatureDx12::InitInternal(ID3D12GraphicsCommandList* commandList, NVSDK
     if (!Config::Instance()->FSRREnabled.value_or_default())
     {
         LOG_INFO("FSR-RR bridge is disabled; using the FSR 2.1.2 fallback");
+        return true;
+    }
+
+    if (Config::Instance()->FSRRCaptureOnly.value_or_default())
+    {
+        LOG_INFO("FSR-RR capture-only mode armed; inputs will be inventoried without denoiser dispatch");
+        parameters->Set("SuperSamplingDenoising.Available", 1);
+        parameters->Set("SuperSamplingDenoising.FeatureInitResult",
+                        static_cast<uint32_t>(NVSDK_NGX_Result_Success));
+        _impl->captureOnly = true;
         return true;
     }
 
@@ -280,7 +291,7 @@ bool FSRRFeatureDx12::InitInternal(ID3D12GraphicsCommandList* commandList, NVSDK
 
 bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, NVSDK_NGX_Parameter* parameters)
 {
-    if (!_impl->bridgeReady)
+    if (!_impl->bridgeReady && !_impl->captureOnly)
         return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
 
     const auto snapshot = CaptureInputs(Handle()->Id, static_cast<uint32_t>(_frameCount), *parameters);
@@ -306,6 +317,12 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     }
     else if (validation.issues.empty())
         _impl->lastWarningKey.clear();
+
+    if (_impl->captureOnly)
+    {
+        _impl->lastFailureKey.clear();
+        return FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+    }
 
     std::string reason;
     const auto* color = Required(snapshot, InputSemantic::Color, reason);

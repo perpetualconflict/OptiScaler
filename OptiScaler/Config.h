@@ -275,6 +275,7 @@ class Config
 
     // Experimental FSR Ray Regeneration 1.2 bridge
     CustomOptional<bool> FSRREnabled { false };
+    CustomOptional<bool> FSRRCaptureOnly { true };
     CustomOptional<bool> FSRRDebugValidation { false };
     CustomOptional<bool> FSRRLogInputs { true };
     CustomOptional<int> FSRRDebugOutput { 0 };

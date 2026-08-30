@@ -387,6 +387,7 @@ bool Config::Reload(std::filesystem::path iniPath)
         // FSR Ray Regeneration
         {
             FSRREnabled.set_from_config(readBool("FSRR", "Enabled"));
+            FSRRCaptureOnly.set_from_config(readBool("FSRR", "CaptureOnly"));
             FSRRDebugValidation.set_from_config(readBool("FSRR", "DebugValidation"));
             FSRRLogInputs.set_from_config(readBool("FSRR", "LogInputs"));
             if (auto setting = readInt("FSRR", "DebugOutput"); setting && *setting >= 0 && *setting <= 5)
@@ -1192,6 +1193,7 @@ bool Config::SaveIni()
     // FSR Ray Regeneration
     {
         ini.SetValue("FSRR", "Enabled", GetBoolValue(Instance()->FSRREnabled.value_for_config()).c_str());
+        ini.SetValue("FSRR", "CaptureOnly", GetBoolValue(Instance()->FSRRCaptureOnly.value_for_config()).c_str());
         ini.SetValue("FSRR", "DebugValidation",
                      GetBoolValue(Instance()->FSRRDebugValidation.value_for_config()).c_str());
         ini.SetValue("FSRR", "LogInputs", GetBoolValue(Instance()->FSRRLogInputs.value_for_config()).c_str());
