@@ -1090,7 +1090,9 @@ class FfxApiProxy
         {
             ffxQueryDescGetVersions versionQuery {};
             versionQuery.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
-            versionQuery.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+            // The current global include path still exposes FFX 1.x headers, which do not define the
+            // denoiser create descriptor. This is the stable FFX API effect/sub-id for that descriptor.
+            versionQuery.createDescType = 0x00050001u;
             uint64_t versionCount = 0;
             versionQuery.outputCount = &versionCount;
 
@@ -1113,7 +1115,7 @@ class FfxApiProxy
                 if (queryResult == FFX_API_RETURN_OK)
                 {
                     denoiser_dx12.version.parse_version(versionNames[0]);
-                    LOG_INFO("FfxApi Dx12 SR version: {}.{}.{}", denoiser_dx12.version.major,
+                    LOG_INFO("FfxApi Dx12 RR version: {}.{}.{}", denoiser_dx12.version.major,
                              denoiser_dx12.version.minor, denoiser_dx12.version.patch);
                 }
                 else
