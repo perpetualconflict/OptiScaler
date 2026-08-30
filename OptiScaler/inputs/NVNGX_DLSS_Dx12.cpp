@@ -4,6 +4,7 @@
 
 #include "NVNGX_DLSS.h"
 #include "NVNGX_Parameter.h"
+#include "proxies/FfxApi_Proxy.h"
 #include "proxies/NVNGX_Proxy.h"
 
 #include <upscalers/FeatureProvider_Dx12.h>
@@ -893,9 +894,22 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
 
     const bool isUpscaling = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling;
     const bool isFG = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
+    const bool isRayReconstruction = FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_RayReconstruction;
     const bool dlssgAdjacent = Nvngx_FG::isDx12Available() || State::Instance().activeFgInput == FGInput::DLSSG;
+    bool fsrrEarlyAvailable = false;
 
-    if (isUpscaling || (isFG && dlssgAdjacent))
+    if (isRayReconstruction && Config::Instance()->FSRREnabled.value_or_default())
+    {
+        const bool captureOnly = Config::Instance()->FSRRCaptureOnly.value_or_default();
+        const bool denoiserReady =
+            !captureOnly && FfxApiProxy::InitFfxDx12_Denoiser() && FfxApiProxy::IsDenoiserReady(false);
+
+        fsrrEarlyAvailable = captureOnly || denoiserReady;
+        LOG_DEBUG("FSR-RR early feature requirement: {} (capture-only: {}, denoiser module: {})",
+                  fsrrEarlyAvailable ? "supported" : "unsupported", captureOnly, denoiserReady);
+    }
+
+    if (isUpscaling || (isFG && dlssgAdjacent) || fsrrEarlyAvailable)
     {
         if (OutSupported == nullptr)
         {
