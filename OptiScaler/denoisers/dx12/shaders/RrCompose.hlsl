@@ -1,7 +1,7 @@
 #define MainRS \
     "RootFlags(0)," \
     "CBV(b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors = 7))," \
+    "DescriptorTable(SRV(t0, numDescriptors = 8))," \
     "DescriptorTable(UAV(u0, numDescriptors = 1))"
 
 Texture2D<float4> InDiffuse : register(t0);
@@ -11,6 +11,7 @@ Texture2D<float4> InNoisyDiffuse : register(t3);
 Texture2D<float4> InNoisySpecular : register(t4);
 Texture2D<float4> InDiffuseAlbedo : register(t5);
 Texture2D<float4> InSpecularAlbedo : register(t6);
+Texture2D<float4> InMotion : register(t7);
 RWTexture2D<float4> OutColor : register(u0);
 
 cbuffer Constants : register(b0)
@@ -44,5 +45,15 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         color = InNoisyDiffuse[pixel].rgb * InDiffuseAlbedo[pixel].rgb;
     else if (DebugOutput == 5)
         color = InNoisySpecular[pixel].rgb * InSpecularAlbedo[pixel].rgb;
+    else if (DebugOutput == 6)
+    {
+        float2 motionPixels = InMotion[pixel].xy * float2(width, height);
+        color = float3(0.5f + 0.05f * motionPixels.x, 0.5f + 0.05f * motionPixels.y, 0.5f);
+    }
+    else if (DebugOutput == 7)
+    {
+        float depthDelta = InMotion[pixel].z;
+        color = float3(0.5f + 0.1f * depthDelta, 0.5f - 0.1f * depthDelta, 0.5f);
+    }
     OutColor[pixel] = float4(max(color, 0.0f), residual.a);
 }

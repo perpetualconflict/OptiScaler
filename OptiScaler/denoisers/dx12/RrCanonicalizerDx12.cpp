@@ -384,7 +384,7 @@ CanonicalizerDx12::CanonicalizerDx12(ID3D12Device* device) : _impl(std::make_uni
         _impl->conversion.Initialize(device, RrCanonicalize_cso, sizeof(RrCanonicalize_cso),
                                      sizeof(ConversionConstants), 10, 8, L"FSRR_CanonicalConstants");
         _impl->composition.Initialize(device, RrCompose_cso, sizeof(RrCompose_cso),
-                                      sizeof(CompositionConstants), 7, 1, L"FSRR_CompositionConstants");
+                                      sizeof(CompositionConstants), 8, 1, L"FSRR_CompositionConstants");
         _impl->ready = true;
     }
     catch (const std::exception& exception)
@@ -592,13 +592,13 @@ bool CanonicalizerDx12::Compose(ID3D12GraphicsCommandList* commandList, FfxRr12:
         Transition(commandList, specular.resource.Get(), specular.state, ComputeRead);
         Transition(commandList, _impl->composedColor.resource.Get(), _impl->composedColor.state, UnorderedAccess);
 
-        std::array<ID3D12Resource*, 7> inputs = {
+        std::array<ID3D12Resource*, 8> inputs = {
             diffuse.resource.Get(), specular.resource.Get(), _impl->residual.resource.Get(),
             noisyDiffuse.resource.Get(), noisySpecular.resource.Get(), _impl->diffuseAlbedo.resource.Get(),
-            _impl->specularAlbedo.resource.Get(),
+            _impl->specularAlbedo.resource.Get(), _impl->motionVectors.resource.Get(),
         };
         std::array<ID3D12Resource*, 1> outputs = { _impl->composedColor.resource.Get() };
-        const CompositionConstants constants { std::min(debugOutput, 5u) };
+        const CompositionConstants constants { std::min(debugOutput, 7u) };
         _impl->composition.Dispatch(commandList, inputs, outputs, _impl->width, _impl->height, &constants,
                                     sizeof(constants));
 
