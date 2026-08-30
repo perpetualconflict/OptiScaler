@@ -3005,8 +3005,14 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
             "Motion Vectors",
             "Depth Delta",
             "Depth-Risk Current Color",
+            "SSS Guide Overlay",
+            "Current-Color Bias Overlay",
+            "Particle Buffer Overlay",
+            "SSS Current-Color A/B",
+            "Bias Current-Color A/B",
+            "Proof Particle Composite A/B",
         };
-        int debugOutput = std::clamp(config->FSRRDebugOutput.value_or_default(), 0, 8);
+        int debugOutput = std::clamp(config->FSRRDebugOutput.value_or_default(), 0, 14);
         ImGui::SetNextItemWidth(190.0f * menuResScale);
         if (ImGui::Combo("Debug Output", &debugOutput, debugOutputs, IM_ARRAYSIZE(debugOutputs)))
             config->FSRRDebugOutput = debugOutput;

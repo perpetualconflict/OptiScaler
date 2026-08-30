@@ -298,7 +298,7 @@ struct alignas(16) ConversionConstants
     std::array<float, 16> previousView {};
     std::array<float, 4> renderSize {};
     std::array<float, 4> motionAndDepthBounds {};
-    std::array<std::array<uint32_t, 4>, 5> inputBases {};
+    std::array<std::array<uint32_t, 4>, 6> inputBases {};
     uint32_t flags = 0;
     std::array<float, 3> padding {};
 };
@@ -330,6 +330,9 @@ struct CanonicalizerDx12::Impl
     Texture diffuseAlbedo;
     Texture specularAlbedo;
     Texture residual;
+    Texture sssGuide;
+    Texture biasMask;
+    Texture colorBeforeParticles;
     Texture composedColor;
     std::array<Texture, 7> signalInputs;
     std::array<Texture, 7> signalOutputs;
@@ -364,6 +367,9 @@ struct CanonicalizerDx12::Impl
         Retire(diffuseAlbedo);
         Retire(specularAlbedo);
         Retire(residual);
+        Retire(sssGuide);
+        Retire(biasMask);
+        Retire(colorBeforeParticles);
         Retire(composedColor);
         for (auto& texture : signalInputs)
             Retire(texture);
@@ -384,9 +390,9 @@ CanonicalizerDx12::CanonicalizerDx12(ID3D12Device* device) : _impl(std::make_uni
     {
         _impl->device = device;
         _impl->conversion.Initialize(device, RrCanonicalize_cso, sizeof(RrCanonicalize_cso),
-                                     sizeof(ConversionConstants), 10, 8, L"FSRR_CanonicalConstants");
+                                     sizeof(ConversionConstants), 13, 11, L"FSRR_CanonicalConstants");
         _impl->composition.Initialize(device, RrCompose_cso, sizeof(RrCompose_cso),
-                                      sizeof(CompositionConstants), 8, 1, L"FSRR_CompositionConstants");
+                                      sizeof(CompositionConstants), 11, 1, L"FSRR_CompositionConstants");
         _impl->ready = true;
     }
     catch (const std::exception& exception)
@@ -428,6 +434,13 @@ bool CanonicalizerDx12::Resize(uint32_t width, uint32_t height)
             CreateTexture(_impl->device, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, L"FSRR_SpecularAlbedo");
         _impl->residual =
             CreateTexture(_impl->device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, L"FSRR_Residual");
+        _impl->sssGuide =
+            CreateTexture(_impl->device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, L"FSRR_SssGuide");
+        _impl->biasMask =
+            CreateTexture(_impl->device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, L"FSRR_BiasMask");
+        _impl->colorBeforeParticles = CreateTexture(_impl->device, width, height,
+                                                     DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                                     L"FSRR_ColorBeforeParticles");
         _impl->composedColor =
             CreateTexture(_impl->device, width, height, DXGI_FORMAT_R16G16B16A16_FLOAT, L"FSRR_ComposedColor");
 
@@ -478,7 +491,7 @@ bool CanonicalizerDx12::Convert(const CanonicalizationDescription& description)
                                  1.0f / description.width, 1.0f / description.height };
         constants.motionAndDepthBounds = { description.motionScaleX, description.motionScaleY,
                                            description.linearDepthMin, description.linearDepthMax };
-        for (size_t pair = 0; pair < 4; ++pair)
+        for (size_t pair = 0; pair < constants.inputBases.size(); ++pair)
         {
             constants.inputBases[pair] = {
                 description.inputSubrectBases[pair * 2][0],
@@ -487,16 +500,10 @@ bool CanonicalizerDx12::Convert(const CanonicalizationDescription& description)
                 description.inputSubrectBases[pair * 2 + 1][1],
             };
         }
-        constants.inputBases[4] = {
-            description.inputSubrectBases[8][0],
-            description.inputSubrectBases[8][1],
-            0,
-            0,
-        };
         constants.flags = description.flags;
 
         const uint32_t previousDepthIndex = 1u - _impl->depthWriteIndex;
-        std::array<ID3D12Resource*, 10> inputs = {
+        std::array<ID3D12Resource*, 13> inputs = {
             description.color,
             description.depth,
             description.motionVectors,
@@ -507,17 +514,21 @@ bool CanonicalizerDx12::Convert(const CanonicalizationDescription& description)
             description.diffuseHitDistance,
             description.specularHitDistance,
             _impl->linearDepth[previousDepthIndex].resource.Get(),
+            description.sssGuide,
+            description.biasMask,
+            description.colorBeforeParticles,
         };
         for (auto* input : inputs)
             ValidateShaderResource(_impl->device, input);
 
         auto& directDiffuse = _impl->signalInputs[SignalIndex(FfxRr12::Signal::DirectDiffuse)];
         auto& indirectSpecular = _impl->signalInputs[SignalIndex(FfxRr12::Signal::IndirectSpecular)];
-        std::array<Texture*, 8> outputTextures = {
+        std::array<Texture*, 11> outputTextures = {
             &_impl->linearDepth[_impl->depthWriteIndex], &_impl->motionVectors, &_impl->normals, &_impl->diffuseAlbedo,
-            &_impl->specularAlbedo, &directDiffuse, &indirectSpecular, &_impl->residual,
+            &_impl->specularAlbedo, &directDiffuse, &indirectSpecular, &_impl->residual, &_impl->sssGuide,
+            &_impl->biasMask, &_impl->colorBeforeParticles,
         };
-        std::array<ID3D12Resource*, 8> outputs {};
+        std::array<ID3D12Resource*, 11> outputs {};
         for (size_t index = 0; index < outputTextures.size(); ++index)
         {
             Transition(description.commandList, outputTextures[index]->resource.Get(), outputTextures[index]->state,
@@ -595,14 +606,16 @@ bool CanonicalizerDx12::Compose(ID3D12GraphicsCommandList* commandList, FfxRr12:
         Transition(commandList, specular.resource.Get(), specular.state, ComputeRead);
         Transition(commandList, _impl->composedColor.resource.Get(), _impl->composedColor.state, UnorderedAccess);
 
-        std::array<ID3D12Resource*, 8> inputs = {
+        std::array<ID3D12Resource*, 11> inputs = {
             diffuse.resource.Get(), specular.resource.Get(), _impl->residual.resource.Get(),
             noisyDiffuse.resource.Get(), noisySpecular.resource.Get(), _impl->diffuseAlbedo.resource.Get(),
             _impl->specularAlbedo.resource.Get(), _impl->motionVectors.resource.Get(),
+            _impl->sssGuide.resource.Get(), _impl->biasMask.resource.Get(),
+            _impl->colorBeforeParticles.resource.Get(),
         };
         std::array<ID3D12Resource*, 1> outputs = { _impl->composedColor.resource.Get() };
         const CompositionConstants constants {
-            .debugOutput = std::min(debugOutput, 8u),
+            .debugOutput = std::min(debugOutput, 14u),
             .useDepthDeltaCurrentColor =
                 recompositionMode == RecompositionMode::DepthDeltaCurrentColor ? 1u : 0u,
             .depthDeltaCurrentColorScale = depthDeltaCurrentColorScale,

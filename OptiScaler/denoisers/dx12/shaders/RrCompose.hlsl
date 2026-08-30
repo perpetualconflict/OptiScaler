@@ -1,7 +1,7 @@
 #define MainRS \
     "RootFlags(0)," \
     "CBV(b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors = 8))," \
+    "DescriptorTable(SRV(t0, numDescriptors = 11))," \
     "DescriptorTable(UAV(u0, numDescriptors = 1))"
 
 Texture2D<float4> InDiffuse : register(t0);
@@ -12,6 +12,9 @@ Texture2D<float4> InNoisySpecular : register(t4);
 Texture2D<float4> InDiffuseAlbedo : register(t5);
 Texture2D<float4> InSpecularAlbedo : register(t6);
 Texture2D<float4> InMotion : register(t7);
+Texture2D<float4> InSssGuide : register(t8);
+Texture2D<float4> InBiasMask : register(t9);
+Texture2D<float4> InColorBeforeParticles : register(t10);
 RWTexture2D<float4> OutColor : register(u0);
 
 cbuffer Constants : register(b0)
@@ -52,6 +55,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float3 currentColor = noisyDiffuse + noisySpecular + residual.rgb;
     float3 denoisedColor = diffuse + specular + residual.rgb;
     float3 color = denoisedColor;
+    float sssGuide = InSssGuide[pixel].r;
+    float sssAmount = saturate(log2(1.0f + abs(sssGuide) * 64.0f) * 0.25f);
+    float biasMask = saturate(InBiasMask[pixel].r);
+    float4 colorBeforeParticles = InColorBeforeParticles[pixel];
     if (UseDepthDeltaCurrentColor != 0)
     {
         float depthRisk = saturate(log2(1.0f + abs(InMotion[pixel].z)) * DepthDeltaCurrentColorScale);
@@ -93,5 +100,29 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         float depthRisk = saturate(log2(1.0f + abs(InMotion[pixel].z)) * 0.5f);
         color = lerp(denoisedColor, currentColor, 0.85f * depthRisk);
     }
+    else if (DebugOutput == 9)
+    {
+        float3 sssTint = sssGuide >= 0.0f ? float3(1.0f, 0.35f, 0.05f) : float3(0.05f, 0.4f, 1.0f);
+        color = DiagnosticOverlay(color, sssTint, sssAmount);
+    }
+    else if (DebugOutput == 10)
+        color = DiagnosticOverlay(color, float3(0.1f, 1.0f, 0.25f), biasMask);
+    else if (DebugOutput == 11)
+    {
+        static const float3 LuminanceWeights = float3(0.2126f, 0.7152f, 0.0722f);
+        float sceneLuminance = max(dot(max(currentColor, 0.0f), LuminanceWeights), 0.02f);
+        float particleLuminance = dot(abs(colorBeforeParticles.rgb), LuminanceWeights);
+        float particleAmount = max(colorBeforeParticles.a, saturate(particleLuminance / sceneLuminance));
+        float3 particleTint = particleLuminance > 0.001f
+                                  ? abs(colorBeforeParticles.rgb)
+                                  : float3(1.0f, 0.55f, 0.05f);
+        color = DiagnosticOverlay(color, particleTint, particleAmount);
+    }
+    else if (DebugOutput == 12)
+        color = lerp(color, currentColor, sssAmount);
+    else if (DebugOutput == 13)
+        color = lerp(color, currentColor, biasMask);
+    else if (DebugOutput == 14)
+        color = (1.0f - colorBeforeParticles.a) * color + colorBeforeParticles.rgb;
     OutColor[pixel] = float4(max(color, 0.0f), residual.a);
 }

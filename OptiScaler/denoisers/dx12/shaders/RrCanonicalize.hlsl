@@ -1,10 +1,10 @@
 #define MainRS \
     "RootFlags(0)," \
     "CBV(b0)," \
-    "DescriptorTable(SRV(t0, numDescriptors = 10))," \
+    "DescriptorTable(SRV(t0, numDescriptors = 13))," \
     "StaticSampler(s0, filter = FILTER_MIN_MAG_MIP_POINT, " \
         "addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP)," \
-    "DescriptorTable(UAV(u0, numDescriptors = 8))"
+    "DescriptorTable(UAV(u0, numDescriptors = 11))"
 
 Texture2D<float4> InColor : register(t0);
 Texture2D<float> InDepth : register(t1);
@@ -16,6 +16,9 @@ Texture2D<float4> InSpecularAlbedo : register(t6);
 Texture2D<float4> InDiffuseHitDistance : register(t7);
 Texture2D<float4> InSpecularHitDistance : register(t8);
 Texture2D<float> InPreviousLinearDepth : register(t9);
+Texture2D<float4> InSssGuide : register(t10);
+Texture2D<float4> InBiasMask : register(t11);
+Texture2D<float4> InColorBeforeParticles : register(t12);
 SamplerState PointClampSampler : register(s0);
 
 RWTexture2D<float> OutLinearDepth : register(u0);
@@ -26,6 +29,9 @@ RWTexture2D<float4> OutSpecularAlbedo : register(u4);
 RWTexture2D<float4> OutDirectDiffuse : register(u5);
 RWTexture2D<float4> OutIndirectSpecular : register(u6);
 RWTexture2D<float4> OutResidual : register(u7);
+RWTexture2D<float4> OutSssGuide : register(u8);
+RWTexture2D<float4> OutBiasMask : register(u9);
+RWTexture2D<float4> OutColorBeforeParticles : register(u10);
 
 cbuffer Constants : register(b0)
 {
@@ -38,7 +44,8 @@ cbuffer Constants : register(b0)
     uint4 InputBase23;
     uint4 InputBase45;
     uint4 InputBase67;
-    uint4 InputBase8;
+    uint4 InputBase89;
+    uint4 InputBase1011;
     uint Flags;
     float3 Padding;
 };
@@ -52,6 +59,9 @@ static const uint FlagHasSpecularHitDistance = 1u << 5;
 static const uint FlagDiffuseHitDistanceInAlpha = 1u << 6;
 static const uint FlagSpecularHitDistanceInAlpha = 1u << 7;
 static const uint FlagHasPreviousLinearDepth = 1u << 8;
+static const uint FlagHasSssGuide = 1u << 9;
+static const uint FlagHasBiasMask = 1u << 10;
+static const uint FlagHasColorBeforeParticles = 1u << 11;
 
 float2 OctEncode(float3 n)
 {
@@ -87,7 +97,10 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     uint2 diffuseAlbedoPixel = pixel + InputBase45.zw;
     uint2 specularAlbedoPixel = pixel + InputBase67.xy;
     uint2 diffuseHitPixel = pixel + InputBase67.zw;
-    uint2 specularHitPixel = pixel + InputBase8.xy;
+    uint2 specularHitPixel = pixel + InputBase89.xy;
+    uint2 sssGuidePixel = pixel + InputBase89.zw;
+    uint2 biasMaskPixel = pixel + InputBase1011.xy;
+    uint2 colorBeforeParticlesPixel = pixel + InputBase1011.zw;
 
     float4 raw = InColor[colorPixel];
     bool rawValid = all(isfinite(raw));
@@ -200,4 +213,29 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
 
     float3 remodulated = diffuseIllumination * diffuseAlbedo + specularIllumination * specularAlbedo;
     OutResidual[pixel] = float4(raw.rgb - remodulated, raw.a);
+
+    float sssGuide = 0.0f;
+    if ((Flags & FlagHasSssGuide) != 0)
+    {
+        float value = InSssGuide[sssGuidePixel].r;
+        sssGuide = isfinite(value) ? value : 0.0f;
+    }
+    OutSssGuide[pixel] = float4(sssGuide, 0.0f, 0.0f, 0.0f);
+
+    float biasMask = 0.0f;
+    if ((Flags & FlagHasBiasMask) != 0)
+    {
+        float value = InBiasMask[biasMaskPixel].r;
+        biasMask = isfinite(value) ? saturate(value) : 0.0f;
+    }
+    OutBiasMask[pixel] = float4(biasMask, 0.0f, 0.0f, 0.0f);
+
+    float4 colorBeforeParticles = 0.0f;
+    if ((Flags & FlagHasColorBeforeParticles) != 0)
+    {
+        float4 value = InColorBeforeParticles[colorBeforeParticlesPixel];
+        colorBeforeParticles = all(isfinite(value)) ? value : 0.0f;
+        colorBeforeParticles.a = saturate(colorBeforeParticles.a);
+    }
+    OutColorBeforeParticles[pixel] = colorBeforeParticles;
 }

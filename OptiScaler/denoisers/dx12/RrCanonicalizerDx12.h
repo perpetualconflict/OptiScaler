@@ -21,6 +21,9 @@ enum class CanonicalizationFlag : uint32_t
     DiffuseHitDistanceInAlpha = 1u << 6,
     SpecularHitDistanceInAlpha = 1u << 7,
     HasPreviousLinearDepth = 1u << 8,
+    HasSssGuide = 1u << 9,
+    HasBiasMask = 1u << 10,
+    HasColorBeforeParticles = 1u << 11,
 };
 
 constexpr uint32_t ToFlag(CanonicalizationFlag flag) { return static_cast<uint32_t>(flag); }
@@ -48,7 +51,10 @@ struct CanonicalizationDescription
     ID3D12Resource* specularAlbedo = nullptr;
     ID3D12Resource* diffuseHitDistance = nullptr;
     ID3D12Resource* specularHitDistance = nullptr;
-    std::array<std::array<uint32_t, 2>, 9> inputSubrectBases {};
+    ID3D12Resource* sssGuide = nullptr;
+    ID3D12Resource* biasMask = nullptr;
+    ID3D12Resource* colorBeforeParticles = nullptr;
+    std::array<std::array<uint32_t, 2>, 12> inputSubrectBases {};
 };
 
 class CanonicalizerDx12

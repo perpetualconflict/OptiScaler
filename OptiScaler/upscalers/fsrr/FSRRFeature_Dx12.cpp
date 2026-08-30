@@ -382,6 +382,9 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
 
     const bool packedRoughness = *snapshot.roughnessMode == 1;
     const auto* roughness = OptionalUsable(snapshot, InputSemantic::Roughness);
+    const auto* sssGuide = OptionalUsable(snapshot, InputSemantic::ScreenSpaceSubsurfaceScatteringGuide);
+    const auto* biasMask = OptionalUsable(snapshot, InputSemantic::BiasMask);
+    const auto* colorBeforeParticles = OptionalUsable(snapshot, InputSemantic::ColorBeforeParticles);
     if (!packedRoughness && !roughness)
     {
         _impl->FailOnce(&snapshot, "unpacked roughness mode requires GBuffer.Roughness");
@@ -472,7 +475,10 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         conversion.roughness = packedRoughness ? nullptr : roughness->resource;
         conversion.diffuseAlbedo = diffuseAlbedo->resource;
         conversion.specularAlbedo = specularAlbedo->resource;
-        const std::array<const ResourceInput*, 9> canonicalInputs = {
+        conversion.sssGuide = sssGuide ? sssGuide->resource : nullptr;
+        conversion.biasMask = biasMask ? biasMask->resource : nullptr;
+        conversion.colorBeforeParticles = colorBeforeParticles ? colorBeforeParticles->resource : nullptr;
+        const std::array<const ResourceInput*, 12> canonicalInputs = {
             color,
             depth,
             motion,
@@ -482,6 +488,9 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             specularAlbedo,
             nullptr,
             specularHitDistance,
+            sssGuide,
+            biasMask,
+            colorBeforeParticles,
         };
         for (size_t index = 0; index < canonicalInputs.size(); ++index)
             if (canonicalInputs[index] && canonicalInputs[index]->IsPresent())
@@ -509,6 +518,12 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             if (specularHitInAlpha)
                 conversion.flags |= ToFlag(CanonicalizationFlag::SpecularHitDistanceInAlpha);
         }
+        if (sssGuide)
+            conversion.flags |= ToFlag(CanonicalizationFlag::HasSssGuide);
+        if (biasMask)
+            conversion.flags |= ToFlag(CanonicalizationFlag::HasBiasMask);
+        if (colorBeforeParticles)
+            conversion.flags |= ToFlag(CanonicalizationFlag::HasColorBeforeParticles);
 
         if (!_impl->canonicalizer->Convert(conversion) ||
             !_impl->canonicalizer->PrepareSignalOutputs(commandList, _impl->profile->signals))
@@ -570,7 +585,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
                          _impl->profile->recompositionMode, _impl->profile->depthDeltaCurrentColorScale,
                          _impl->profile->depthDeltaCurrentColorStrength,
                          static_cast<uint32_t>(std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(),
-                                                          0, 8))))
+                                                          0, 14))))
                 _impl->FailOnce(&snapshot, "composition failed: " + _impl->canonicalizer->LastError());
             else
                 rrSucceeded = true;
@@ -592,7 +607,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             "FSR-RR first active dispatch succeeded: handle={}, frame={}, render={}x{}, "
             "signals=direct_diffuse|indirect_specular, debug_output={}",
             Handle()->Id, snapshot.frameIndex, snapshot.renderWidth, snapshot.renderHeight,
-            std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 8));
+            std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 14));
         _impl->loggedFirstDispatch = true;
     }
 

@@ -390,7 +390,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             FSRRCaptureOnly.set_from_config(readBool("FSRR", "CaptureOnly"));
             FSRRDebugValidation.set_from_config(readBool("FSRR", "DebugValidation"));
             FSRRLogInputs.set_from_config(readBool("FSRR", "LogInputs"));
-            if (auto setting = readInt("FSRR", "DebugOutput"); setting && *setting >= 0 && *setting <= 8)
+            if (auto setting = readInt("FSRR", "DebugOutput"); setting && *setting >= 0 && *setting <= 14)
                 FSRRDebugOutput.set_from_config(setting);
         }
 
