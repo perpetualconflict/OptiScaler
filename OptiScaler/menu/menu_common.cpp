@@ -3011,8 +3011,14 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
             "SSS Current-Color A/B",
             "Bias Current-Color A/B",
             "Proof Particle Composite A/B",
+            "Pure Denoised Composite",
+            "Full Current Color",
+            "SSS Denoised A/B",
+            "Bias Denoised A/B",
+            "Residual Energy Overlay",
+            "SSS Residual Suppression A/B",
         };
-        int debugOutput = std::clamp(config->FSRRDebugOutput.value_or_default(), 0, 14);
+        int debugOutput = std::clamp(config->FSRRDebugOutput.value_or_default(), 0, 20);
         ImGui::SetNextItemWidth(190.0f * menuResScale);
         if (ImGui::Combo("Debug Output", &debugOutput, debugOutputs, IM_ARRAYSIZE(debugOutputs)))
             config->FSRRDebugOutput = debugOutput;

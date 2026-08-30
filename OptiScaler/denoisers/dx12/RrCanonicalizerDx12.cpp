@@ -615,7 +615,7 @@ bool CanonicalizerDx12::Compose(ID3D12GraphicsCommandList* commandList, FfxRr12:
         };
         std::array<ID3D12Resource*, 1> outputs = { _impl->composedColor.resource.Get() };
         const CompositionConstants constants {
-            .debugOutput = std::min(debugOutput, 14u),
+            .debugOutput = std::min(debugOutput, 20u),
             .useDepthDeltaCurrentColor =
                 recompositionMode == RecompositionMode::DepthDeltaCurrentColor ? 1u : 0u,
             .depthDeltaCurrentColorScale = depthDeltaCurrentColorScale,

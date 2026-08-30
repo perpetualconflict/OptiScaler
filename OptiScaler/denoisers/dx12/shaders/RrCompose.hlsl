@@ -124,5 +124,20 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         color = lerp(color, currentColor, biasMask);
     else if (DebugOutput == 14)
         color = (1.0f - colorBeforeParticles.a) * color + colorBeforeParticles.rgb;
+    else if (DebugOutput == 15)
+        color = denoisedColor;
+    else if (DebugOutput == 16)
+        color = currentColor;
+    else if (DebugOutput == 17)
+        color = lerp(color, denoisedColor, sssAmount);
+    else if (DebugOutput == 18)
+        color = lerp(color, denoisedColor, biasMask);
+    else if (DebugOutput == 19)
+    {
+        float residualMagnitude = length(residual.rgb) / max(length(currentColor), 0.02f);
+        color = DiagnosticOverlay(color, float3(1.0f, 0.05f, 0.7f), residualMagnitude);
+    }
+    else if (DebugOutput == 20)
+        color = max(color - residual.rgb * sssAmount, 0.0f);
     OutColor[pixel] = float4(max(color, 0.0f), residual.a);
 }

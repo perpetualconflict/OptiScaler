@@ -72,6 +72,12 @@ const char* DebugOutputName(uint32_t output)
         "sss_current_color_ab",
         "bias_current_color_ab",
         "proof_particle_composite_ab",
+        "pure_denoised_composite",
+        "full_current_color",
+        "sss_denoised_ab",
+        "bias_denoised_ab",
+        "residual_energy_overlay",
+        "sss_residual_suppression_ab",
     };
     return output < names.size() ? names[output] : "unknown";
 }
@@ -606,7 +612,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             else
             {
                 const auto debugOutput = static_cast<uint32_t>(
-                    std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 14));
+                    std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 20));
                 if (!_impl->lastDebugOutput || *_impl->lastDebugOutput != debugOutput)
                 {
                     LOG_INFO("FSR-RR debug output changed: handle={}, frame={}, debug_output={} ({})",
@@ -639,7 +645,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
             "FSR-RR first active dispatch succeeded: handle={}, frame={}, render={}x{}, "
             "signals=direct_diffuse|indirect_specular, debug_output={}",
             Handle()->Id, snapshot.frameIndex, snapshot.renderWidth, snapshot.renderHeight,
-            std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 14));
+            std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 20));
         _impl->loggedFirstDispatch = true;
     }
 
