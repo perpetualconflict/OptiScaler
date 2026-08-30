@@ -11,6 +11,7 @@
 #include <menu/menu_overlay_base.h>
 #include <framegen/nvngx/Nvngx_FG.h>
 #include <proxies/KernelBase_Proxy.h>
+#include <proxies/FfxApi_Proxy.h>
 #include <imgui/ImGuiNotify.hpp>
 
 #include <json.hpp>
@@ -764,9 +765,17 @@ void StreamlineHooks::spoofArch(uint32_t currentArch, sl::Feature feature, Syste
             return setArch(maxArch, altSystemCaps);
     }
 
-    // Don't spoof DLSSD at all
+    // FSR-RR is DX12-only. This early Streamline gate is necessarily optimistic;
+    // device/version validation happens when the NGX feature initializes.
     else if (feature == sl::kFeatureDLSS_RR)
     {
+        if (Config::Instance()->FSRREnabled.value_or_default() &&
+            FfxApiProxy::InitFfxDx12_Denoiser() && FfxApiProxy::IsDenoiserReady(false))
+        {
+            LOG_DEBUG("Spoofing Streamline architecture for the experimental FSR-RR bridge");
+            return setArch(maxArch, altSystemCaps);
+        }
+
         return;
     }
 

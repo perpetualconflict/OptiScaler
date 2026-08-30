@@ -257,7 +257,10 @@ copy $(SolutionDir)external\FidelityFX-SDK\PrebuiltSignedDLL\amd_fidelityfx_vk.d
 copy $(SolutionDir)external\FidelityFX-SDK-v2\Kits\FidelityFX\signedbin\amd_fidelityfx_loader_dx12.dll $(SolutionDir)x64\Release\a\OptiScaler\ /Y
 copy $(SolutionDir)external\FidelityFX-SDK-v2\Kits\FidelityFX\signedbin\amd_fidelityfx_upscaler_dx12.dll $(SolutionDir)x64\Release\a\OptiScaler\ /Y
 copy $(SolutionDir)external\FidelityFX-SDK-v2\Kits\FidelityFX\signedbin\amd_fidelityfx_framegeneration_dx12.dll $(SolutionDir)x64\Release\a\OptiScaler\ /Y
+copy $(SolutionDir)external\FidelityFX-SDK-v2\Kits\FidelityFX\signedbin\amd_fidelityfx_denoiser_dx12.dll $(SolutionDir)x64\Release\a\OptiScaler\ /Y
 copy $(SolutionDir)external\FidelityFX-SDK-v2\docs\license.md $(SolutionDir)x64\Release\a\Licenses\FidelityFX_v2_LICENSE.md /Y
+md $(SolutionDir)x64\Release\a\OptiScaler\profiles
+copy $(SolutionDir)OptiScaler\profiles\fsrr.json $(SolutionDir)x64\Release\a\OptiScaler\profiles\ /Y
 copy $(SolutionDir)OptiScaler.ini $(SolutionDir)x64\Release\a\ /Y
 copy $(SolutionDir)setup_windows.bat $(SolutionDir)x64\Release\a\ /Y
 copy $(SolutionDir)setup_linux.sh $(SolutionDir)x64\Release\a\ /Y
@@ -511,6 +514,13 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="upscalers\fsr31\FSR31Feature_Dx11.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Dx11On12.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Dx12.h" />
+    <ClInclude Include="denoisers\ffx12\FfxRr12Provider.h" />
+    <ClInclude Include="denoisers\RrInputRegistry.h" />
+    <ClInclude Include="denoisers\RrProfile.h" />
+    <ClInclude Include="denoisers\dx12\RrCanonicalizerDx12.h" />
+    <ClInclude Include="denoisers\dx12\shaders\RrCanonicalize_Shader.h" />
+    <ClInclude Include="denoisers\dx12\shaders\RrCompose_Shader.h" />
+    <ClInclude Include="upscalers\fsrr\FSRRFeature_Dx12.h" />
     <ClInclude Include="upscalers\ffx\FFXFeature_Vk.h" />
     <ClInclude Include="inputs\FfxApi_Dx12.h" />
     <ClInclude Include="inputs\FSR2_Dx12.h" />
@@ -598,6 +608,11 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="framegen\nvngx\Nvngx_Combo.cpp" />
+    <ClCompile Include="denoisers\ffx12\FfxRr12Provider.cpp" />
+    <ClCompile Include="denoisers\RrInputRegistry.cpp" />
+    <ClCompile Include="denoisers\RrProfile.cpp" />
+    <ClCompile Include="denoisers\dx12\RrCanonicalizerDx12.cpp" />
+    <ClCompile Include="upscalers\fsrr\FSRRFeature_Dx12.cpp" />
     <ClCompile Include="fsr4\FSR4Upgrade.cpp" />
     <ClCompile Include="gpu_time\GpuTime_Dx11.cpp" />
     <ClCompile Include="gpu_time\GpuTime_Dx12.cpp" />
@@ -844,6 +859,9 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
   </ItemGroup>
   <ItemGroup>
     <None Include="Source.def" />
+    <None Include="profiles\fsrr.json" />
+    <None Include="denoisers\dx12\shaders\RrCanonicalize.hlsl" />
+    <None Include="denoisers\dx12\shaders\RrCompose.hlsl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

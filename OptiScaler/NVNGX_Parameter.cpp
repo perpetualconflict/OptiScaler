@@ -7,6 +7,7 @@
 #include <ankerl/unordered_dense.h>
 #include <misc/IdentifyGpu.h>
 #include <framegen/nvngx/Nvngx_FG.h>
+#include <proxies/FfxApi_Proxy.h>
 
 /// @brief Calculates the resolution scaling ratio override based on the provided quality level and current
 /// configuration.
@@ -780,6 +781,10 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams, API api)
     auto primaryGpu = IdentifyGpu::getPrimaryGpu();
     if (!primaryGpu.dlssCapable)
     {
+        const bool fsrrAvailable =
+            api == API::DX12 && Config::Instance()->FSRREnabled.value_or_default() &&
+            FfxApiProxy::InitFfxDx12_Denoiser() && FfxApiProxy::IsDenoiserReady(false);
+
         InParams->Set("SuperSamplingDenoising.NeedsUpdatedDriver", 0);
 
         if (State::Instance().NVNGX_Engine == NVSDK_NGX_ENGINE_TYPE_UNREAL ||
@@ -795,8 +800,11 @@ void InitNGXParameters(NVSDK_NGX_Parameter* InParams, API api)
             InParams->Set("SuperSamplingDenoising.MinDriverVersionMinor", 0);
         }
 
-        InParams->Set("SuperSamplingDenoising.Available", 0);
-        InParams->Set("SuperSamplingDenoising.FeatureInitResult", 0);
+        InParams->Set("SuperSamplingDenoising.Available", fsrrAvailable ? 1 : 0);
+        InParams->Set("SuperSamplingDenoising.FeatureInitResult", fsrrAvailable ? 1 : 0);
+
+        LOG_INFO("Experimental FSR-RR support advertisement: {} (API: {})", fsrrAvailable ? "enabled" : "disabled",
+                 magic_enum::enum_name(api));
     }
 
     if ((api == API::DX12 || api == API::Vulkan) && (State::Instance().activeFgInput == FGInput::DLSSG ||

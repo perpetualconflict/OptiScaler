@@ -10,6 +10,7 @@
 #include "upscalers/dlssd/DLSSDFeature_Dx12.h"
 #include "upscalers/fsr2/FSR2Feature_Dx12.h"
 #include "upscalers/fsr2_212/FSR2Feature_Dx12_212.h"
+#include "upscalers/fsrr/FSRRFeature_Dx12.h"
 #include "upscalers/ffx/FFXFeature_Dx12.h"
 #include "upscalers/xess/XeSSFeature_Dx12.h"
 #include "FeatureProvider_Dx11.h"
@@ -62,8 +63,13 @@ bool FeatureProvider_Dx12::GetFeature(Upscaler upscaler, UINT handleId, NVSDK_NG
         }
         else
         {
-            *feature = std::make_unique<FSR2FeatureDx12_212>(handleId, parameters);
-            upscaler = Upscaler::FSR21;
+            if (cfg.FSRREnabled.value_or_default())
+                *feature = std::make_unique<FSRRFeatureDx12>(handleId, parameters);
+            else
+            {
+                *feature = std::make_unique<FSR2FeatureDx12_212>(handleId, parameters);
+                upscaler = Upscaler::FSR21;
+            }
             break;
         }
 

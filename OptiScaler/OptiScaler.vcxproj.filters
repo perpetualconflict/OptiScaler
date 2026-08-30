@@ -803,6 +803,27 @@
     <ClInclude Include="upscalers\ffx\FFXFeature_Vk.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="denoisers\ffx12\FfxRr12Provider.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="denoisers\RrInputRegistry.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="denoisers\RrProfile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="denoisers\dx12\RrCanonicalizerDx12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="denoisers\dx12\shaders\RrCanonicalize_Shader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="denoisers\dx12\shaders\RrCompose_Shader.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="upscalers\fsrr\FSRRFeature_Dx12.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="shaders\Shader_Common.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -1394,6 +1415,21 @@
     <ClCompile Include="upscalers\ffx\FFXFeature_Vk.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="denoisers\ffx12\FfxRr12Provider.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="denoisers\RrInputRegistry.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="denoisers\RrProfile.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="denoisers\dx12\RrCanonicalizerDx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="upscalers\fsrr\FSRRFeature_Dx12.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="shaders\Shader_Common.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -1529,6 +1565,15 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="Source.def">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="profiles\fsrr.json">
+      <Filter>Other</Filter>
+    </None>
+    <None Include="denoisers\dx12\shaders\RrCanonicalize.hlsl">
+      <Filter>Source Files</Filter>
+    </None>
+    <None Include="denoisers\dx12\shaders\RrCompose.hlsl">
       <Filter>Source Files</Filter>
     </None>
   </ItemGroup>
