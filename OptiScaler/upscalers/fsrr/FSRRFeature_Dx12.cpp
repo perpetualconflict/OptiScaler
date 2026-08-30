@@ -54,6 +54,28 @@ const ResourceInput* OptionalUsable(const InputSnapshot& snapshot, InputSemantic
     return Required(snapshot, semantic, ignored);
 }
 
+const char* DebugOutputName(uint32_t output)
+{
+    static constexpr std::array names = {
+        "recomposed_result",
+        "denoised_diffuse",
+        "denoised_specular",
+        "residual",
+        "noisy_diffuse",
+        "noisy_specular",
+        "motion_vectors",
+        "depth_delta",
+        "depth_risk_current_color",
+        "sss_guide_overlay",
+        "current_color_bias_overlay",
+        "particle_buffer_overlay",
+        "sss_current_color_ab",
+        "bias_current_color_ab",
+        "proof_particle_composite_ab",
+    };
+    return output < names.size() ? names[output] : "unknown";
+}
+
 std::array<float, 16> Transpose(const std::array<float, 16>& input)
 {
     std::array<float, 16> output {};
@@ -185,6 +207,7 @@ struct FSRRFeatureDx12::Impl
     bool resetHistory = true;
     bool hasPreviousCamera = false;
     bool loggedFirstDispatch = false;
+    std::optional<uint32_t> lastDebugOutput;
     uint32_t contextWidth = 0;
     uint32_t contextHeight = 0;
     std::array<float, 16> previousView {};
@@ -580,15 +603,24 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
 
             if (!_impl->provider.Dispatch(dispatch))
                 _impl->FailOnce(&snapshot, "provider dispatch failed: " + _impl->provider.LastError());
-            else if (!_impl->canonicalizer->Compose(
-                         commandList, _impl->profile->signals,
-                         _impl->profile->recompositionMode, _impl->profile->depthDeltaCurrentColorScale,
-                         _impl->profile->depthDeltaCurrentColorStrength,
-                         static_cast<uint32_t>(std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(),
-                                                          0, 14))))
-                _impl->FailOnce(&snapshot, "composition failed: " + _impl->canonicalizer->LastError());
             else
-                rrSucceeded = true;
+            {
+                const auto debugOutput = static_cast<uint32_t>(
+                    std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 14));
+                if (!_impl->lastDebugOutput || *_impl->lastDebugOutput != debugOutput)
+                {
+                    LOG_INFO("FSR-RR debug output changed: handle={}, frame={}, debug_output={} ({})",
+                             Handle()->Id, snapshot.frameIndex, debugOutput, DebugOutputName(debugOutput));
+                    _impl->lastDebugOutput = debugOutput;
+                }
+                if (!_impl->canonicalizer->Compose(
+                        commandList, _impl->profile->signals,
+                        _impl->profile->recompositionMode, _impl->profile->depthDeltaCurrentColorScale,
+                        _impl->profile->depthDeltaCurrentColorStrength, debugOutput))
+                    _impl->FailOnce(&snapshot, "composition failed: " + _impl->canonicalizer->LastError());
+                else
+                    rrSucceeded = true;
+            }
         }
     }
 
