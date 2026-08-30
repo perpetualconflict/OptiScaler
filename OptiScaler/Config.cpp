@@ -384,6 +384,15 @@ bool Config::Reload(std::filesystem::path iniPath)
                 DLSSDRenderPresetUltraPerformance.set_from_config(setting);
         }
 
+        // FSR Ray Regeneration
+        {
+            FSRREnabled.set_from_config(readBool("FSRR", "Enabled"));
+            FSRRDebugValidation.set_from_config(readBool("FSRR", "DebugValidation"));
+            FSRRLogInputs.set_from_config(readBool("FSRR", "LogInputs"));
+            if (auto setting = readInt("FSRR", "DebugOutput"); setting && *setting >= 0 && *setting <= 5)
+                FSRRDebugOutput.set_from_config(setting);
+        }
+
         // NvngxFG
         {
             if (auto setting = readBool("Nukems", "MakeDepthCopy"); setting.has_value() && setting.value())
@@ -1178,6 +1187,15 @@ bool Config::SaveIni()
                      GetIntValue(Instance()->DLSSDRenderPresetPerformance.value_for_config()).c_str());
         ini.SetValue("DLSSD", "RenderPresetUltraPerformance",
                      GetIntValue(Instance()->DLSSDRenderPresetUltraPerformance.value_for_config()).c_str());
+    }
+
+    // FSR Ray Regeneration
+    {
+        ini.SetValue("FSRR", "Enabled", GetBoolValue(Instance()->FSRREnabled.value_for_config()).c_str());
+        ini.SetValue("FSRR", "DebugValidation",
+                     GetBoolValue(Instance()->FSRRDebugValidation.value_for_config()).c_str());
+        ini.SetValue("FSRR", "LogInputs", GetBoolValue(Instance()->FSRRLogInputs.value_for_config()).c_str());
+        ini.SetValue("FSRR", "DebugOutput", GetIntValue(Instance()->FSRRDebugOutput.value_for_config()).c_str());
     }
 
     // NvngxFG

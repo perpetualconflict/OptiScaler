@@ -273,6 +273,12 @@ class Config
     CustomOptional<uint32_t> DLSSDRenderPresetPerformance { 0 };
     CustomOptional<uint32_t> DLSSDRenderPresetUltraPerformance { 0 };
 
+    // Experimental FSR Ray Regeneration 1.2 bridge
+    CustomOptional<bool> FSRREnabled { false };
+    CustomOptional<bool> FSRRDebugValidation { false };
+    CustomOptional<bool> FSRRLogInputs { true };
+    CustomOptional<int> FSRRDebugOutput { 0 };
+
     // Nukems
     CustomOptional<bool> NvngxFGMakeDepthCopy { false };
 

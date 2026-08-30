@@ -175,6 +175,28 @@ It can be changed from the in-game menu with real-time results.
 
 ![fsr](images/fsr.png)
 
+### Experimental FSR Ray Regeneration 1.2 bridge
+
+The working fork contains an experimental DirectX 12 bridge from DLSS Ray Reconstruction inputs to AMD FSR Ray Regeneration 1.2. It is disabled by default and also requires an enabled, capture-validated executable entry in `OptiScaler/profiles/fsrr.json`. Enabling the INI switch alone does not make the seeded Cyberpunk profile dispatchable.
+
+```ini
+[FSRR]
+; Enable conditional Streamline/NGX exposure and the DX12 bridge.
+Enabled=false
+
+; Enable the FidelityFX provider validation/debug layer.
+DebugValidation=false
+
+; Log normalized resources and metadata when their layout changes.
+LogInputs=true
+
+; 0=composited result, 1=denoised diffuse, 2=denoised specular,
+; 3=residual/skipped color, 4=noisy diffuse, 5=noisy specular.
+DebugOutput=0
+```
+
+Missing or incompatible inputs do not hard-crash the game-facing feature: the bridge logs the reason, resets its denoiser history, and uses ordinary FSR 2.1.2 upscaling for that evaluation. The current adapter requires paired indirect diffuse/specular signals plus compatible diffuse and specular hit-distance resources. See the workspace document `docs/FSRR_1_2_IMPLEMENTATION.md` before adding or validating a profile.
+
 ### Sharpness
 DLSS used to have a sharpening option, but later it was removed. So some games have sharpness slider and some do not. With this option you can disable or enable the sharpness of the final image. FSR has built in sharpness but for XeSS CAS option must be enabled.
 
