@@ -184,6 +184,7 @@ struct FSRRFeatureDx12::Impl
     bool contextReady = false;
     bool resetHistory = true;
     bool hasPreviousCamera = false;
+    bool loggedFirstDispatch = false;
     uint32_t contextWidth = 0;
     uint32_t contextHeight = 0;
     std::array<float, 16> previousView {};
@@ -569,6 +570,16 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     _impl->hasPreviousCamera = true;
     _impl->resetHistory = false;
     _impl->lastFailureKey.clear();
+
+    if (!_impl->loggedFirstDispatch)
+    {
+        LOG_INFO(
+            "FSR-RR first active dispatch succeeded: handle={}, frame={}, render={}x{}, "
+            "signals=direct_diffuse|indirect_specular, debug_output={}",
+            Handle()->Id, snapshot.frameIndex, snapshot.renderWidth, snapshot.renderHeight,
+            std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(), 0, 5));
+        _impl->loggedFirstDispatch = true;
+    }
 
     ID3D12Resource* originalColor = color->resource;
     auto* composedColor = _impl->canonicalizer->ComposedColor();
