@@ -24,6 +24,11 @@ $knownSignals = @(
     'specular_occlusion'
 )
 
+$knownRecompositionModes = @(
+    'denoised',
+    'depth_delta_current_color'
+)
+
 $ids = @{}
 foreach ($profile in $document.profiles) {
     if (-not $profile.id -or $ids.ContainsKey($profile.id)) {
@@ -39,6 +44,18 @@ foreach ($profile in $document.profiles) {
     }
     if ($profile.linear_depth_min -lt 0 -or $profile.linear_depth_min -ge $profile.linear_depth_max) {
         throw "Profile '$($profile.id)' has invalid linear depth bounds."
+    }
+    if ($profile.recomposition_mode -notin $knownRecompositionModes) {
+        throw "Profile '$($profile.id)' names unknown recomposition mode '$($profile.recomposition_mode)'."
+    }
+    if ($profile.recomposition_mode -eq 'depth_delta_current_color') {
+        if ($profile.depth_delta_current_color_scale -le 0) {
+            throw "Profile '$($profile.id)' must use a positive depth-delta current-color scale."
+        }
+        if ($profile.depth_delta_current_color_strength -le 0 -or
+            $profile.depth_delta_current_color_strength -gt 1) {
+            throw "Profile '$($profile.id)' must use a depth-delta current-color strength in (0, 1]."
+        }
     }
 
     foreach ($signal in @($profile.signals) + @($profile.checkerboard_signals)) {

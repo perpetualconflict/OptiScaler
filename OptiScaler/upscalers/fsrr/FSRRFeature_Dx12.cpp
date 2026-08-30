@@ -303,8 +303,17 @@ bool FSRRFeatureDx12::InitInternal(ID3D12GraphicsCommandList* commandList, NVSDK
     const auto depthDeltaSource =
         _impl->profile->depthDeltaSource == DepthDeltaSource::ReprojectedHistory ? "reprojected_history"
                                                                                 : "camera_reprojection";
-    LOG_INFO("FSR-RR bridge armed with provider {}.{}.{} ({}) and profile '{}' (depth_delta_source={})",
-             version.major, version.minor, version.patch, version.name, _impl->profile->id, depthDeltaSource);
+    const auto recompositionMode =
+        _impl->profile->recompositionMode == RecompositionMode::DepthDeltaCurrentColor
+            ? "depth_delta_current_color"
+            : "denoised";
+    LOG_INFO(
+        "FSR-RR bridge armed with provider {}.{}.{} ({}) and profile '{}' "
+        "(depth_delta_source={}, recomposition={}, depth_delta_current_color_scale={}, "
+        "depth_delta_current_color_strength={})",
+        version.major, version.minor, version.patch, version.name, _impl->profile->id, depthDeltaSource,
+        recompositionMode, _impl->profile->depthDeltaCurrentColorScale,
+        _impl->profile->depthDeltaCurrentColorStrength);
     parameters->Set("SuperSamplingDenoising.Available", 1);
     parameters->Set("SuperSamplingDenoising.FeatureInitResult", static_cast<uint32_t>(NVSDK_NGX_Result_Success));
     _impl->bridgeReady = true;
@@ -558,6 +567,8 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
                 _impl->FailOnce(&snapshot, "provider dispatch failed: " + _impl->provider.LastError());
             else if (!_impl->canonicalizer->Compose(
                          commandList, _impl->profile->signals,
+                         _impl->profile->recompositionMode, _impl->profile->depthDeltaCurrentColorScale,
+                         _impl->profile->depthDeltaCurrentColorStrength,
                          static_cast<uint32_t>(std::clamp(Config::Instance()->FSRRDebugOutput.value_or_default(),
                                                           0, 8))))
                 _impl->FailOnce(&snapshot, "composition failed: " + _impl->canonicalizer->LastError());

@@ -306,7 +306,9 @@ struct alignas(16) ConversionConstants
 struct alignas(16) CompositionConstants
 {
     uint32_t debugOutput = 0;
-    std::array<uint32_t, 3> padding {};
+    uint32_t useDepthDeltaCurrentColor = 0;
+    float depthDeltaCurrentColorScale = 0.0f;
+    float depthDeltaCurrentColorStrength = 0.0f;
 };
 } // namespace
 
@@ -572,7 +574,8 @@ bool CanonicalizerDx12::PrepareSignalOutputs(ID3D12GraphicsCommandList* commandL
 }
 
 bool CanonicalizerDx12::Compose(ID3D12GraphicsCommandList* commandList, FfxRr12::SignalMask signals,
-                                uint32_t debugOutput)
+                                RecompositionMode recompositionMode, float depthDeltaCurrentColorScale,
+                                float depthDeltaCurrentColorStrength, uint32_t debugOutput)
 {
     const auto supportedSignals = FfxRr12::ToMask(FfxRr12::Signal::DirectDiffuse) |
                                   FfxRr12::ToMask(FfxRr12::Signal::IndirectSpecular);
@@ -598,7 +601,13 @@ bool CanonicalizerDx12::Compose(ID3D12GraphicsCommandList* commandList, FfxRr12:
             _impl->specularAlbedo.resource.Get(), _impl->motionVectors.resource.Get(),
         };
         std::array<ID3D12Resource*, 1> outputs = { _impl->composedColor.resource.Get() };
-        const CompositionConstants constants { std::min(debugOutput, 8u) };
+        const CompositionConstants constants {
+            .debugOutput = std::min(debugOutput, 8u),
+            .useDepthDeltaCurrentColor =
+                recompositionMode == RecompositionMode::DepthDeltaCurrentColor ? 1u : 0u,
+            .depthDeltaCurrentColorScale = depthDeltaCurrentColorScale,
+            .depthDeltaCurrentColorStrength = depthDeltaCurrentColorStrength,
+        };
         _impl->composition.Dispatch(commandList, inputs, outputs, _impl->width, _impl->height, &constants,
                                     sizeof(constants));
 

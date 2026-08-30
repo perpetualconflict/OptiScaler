@@ -17,7 +17,9 @@ RWTexture2D<float4> OutColor : register(u0);
 cbuffer Constants : register(b0)
 {
     uint DebugOutput;
-    uint3 Padding;
+    uint UseDepthDeltaCurrentColor;
+    float DepthDeltaCurrentColorScale;
+    float DepthDeltaCurrentColorStrength;
 };
 
 float3 DiagnosticOverlay(float3 sceneColor, float3 diagnosticTint, float amount)
@@ -48,7 +50,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     float3 noisyDiffuse = InNoisyDiffuse[pixel].rgb * diffuseAlbedo;
     float3 noisySpecular = InNoisySpecular[pixel].rgb * specularAlbedo;
     float3 currentColor = noisyDiffuse + noisySpecular + residual.rgb;
-    float3 color = diffuse + specular + residual.rgb;
+    float3 denoisedColor = diffuse + specular + residual.rgb;
+    float3 color = denoisedColor;
+    if (UseDepthDeltaCurrentColor != 0)
+    {
+        float depthRisk = saturate(log2(1.0f + abs(InMotion[pixel].z)) * DepthDeltaCurrentColorScale);
+        color = lerp(color, currentColor, DepthDeltaCurrentColorStrength * depthRisk);
+    }
     if (DebugOutput == 1)
         color = diffuse;
     else if (DebugOutput == 2)
@@ -83,7 +91,7 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
         // Match the depth-delta overlay's replacement strength so this is a causal A/B: pixels that
         // were diagnostic tint in mode 7 instead receive the non-temporal, reconstructed current color.
         float depthRisk = saturate(log2(1.0f + abs(InMotion[pixel].z)) * 0.5f);
-        color = lerp(color, currentColor, 0.85f * depthRisk);
+        color = lerp(denoisedColor, currentColor, 0.85f * depthRisk);
     }
     OutColor[pixel] = float4(max(color, 0.0f), residual.a);
 }

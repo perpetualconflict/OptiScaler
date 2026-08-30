@@ -10,13 +10,16 @@
       "matrix_conversion": "direct_copy",
       "depth_convention": "hardware",
       "motion_vector_direction": "previous_minus_current",
-      "depth_delta_source": "reprojected_history",
+      "depth_delta_source": "camera_reprojection",
+      "recomposition_mode": "depth_delta_current_color",
+      "depth_delta_current_color_scale": 0.5,
+      "depth_delta_current_color_strength": 0.85,
       "signal_adapter": "composite_albedo_split",
       "signals": ["direct_diffuse", "indirect_specular"],
       "checkerboard_signals": [],
       "linear_depth_min": 0.01,
       "linear_depth_max": 10000.0,
-      "notes": "The proof's no-distance diffuse channel maps to FSR-RR 1.2 direct diffuse; its specular channel remains indirect and uses Cyberpunk's specular hit distance. Deliberately disabled until the active adapter is capture-validated."
+      "notes": "The proof's no-distance diffuse channel maps to FSR-RR 1.2 direct diffuse; its specular channel remains indirect and uses Cyberpunk's specular hit distance. Camera-reprojected depth delta with a 0.5 scale and 0.85 current-color strength removed moving-object trails in a live A/B. Deliberately disabled until the full adapter is capture-validated."
     }
   ]
 }

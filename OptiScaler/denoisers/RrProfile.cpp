@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <fstream>
 #include <json.hpp>
 
@@ -61,6 +62,15 @@ DepthDeltaSource ParseDepthDeltaSource(const std::string& value)
     if (value == "camera_reprojection")
         return DepthDeltaSource::CameraReprojection;
     return DepthDeltaSource::Unspecified;
+}
+
+RecompositionMode ParseRecompositionMode(const std::string& value)
+{
+    if (value == "denoised")
+        return RecompositionMode::Denoised;
+    if (value == "depth_delta_current_color")
+        return RecompositionMode::DepthDeltaCurrentColor;
+    return RecompositionMode::Unspecified;
 }
 
 SignalAdapter ParseSignalAdapter(const std::string& value)
@@ -123,6 +133,15 @@ bool Profile::IsDispatchable(std::string& reason) const
         reason = "motion-vector direction is unspecified";
     else if (depthDeltaSource == DepthDeltaSource::Unspecified)
         reason = "depth-delta source is unspecified";
+    else if (recompositionMode == RecompositionMode::Unspecified)
+        reason = "recomposition mode is unspecified";
+    else if (recompositionMode == RecompositionMode::DepthDeltaCurrentColor &&
+             (!std::isfinite(depthDeltaCurrentColorScale) || depthDeltaCurrentColorScale <= 0.0f))
+        reason = "depth-delta current-color scale is invalid";
+    else if (recompositionMode == RecompositionMode::DepthDeltaCurrentColor &&
+             (!std::isfinite(depthDeltaCurrentColorStrength) || depthDeltaCurrentColorStrength <= 0.0f ||
+              depthDeltaCurrentColorStrength > 1.0f))
+        reason = "depth-delta current-color strength is invalid";
     else if (signalAdapter == SignalAdapter::Disabled || signals == 0)
         reason = "no signal adapter or signal mask is enabled";
     else if ((checkerboardSignals & ~signals) != 0)
@@ -168,6 +187,10 @@ bool ProfileDatabase::Load(const std::filesystem::path& path)
                 ParseMotionDirection(Lower(value.value("motion_vector_direction", "unspecified")));
             profile.depthDeltaSource =
                 ParseDepthDeltaSource(Lower(value.value("depth_delta_source", "unspecified")));
+            profile.recompositionMode =
+                ParseRecompositionMode(Lower(value.value("recomposition_mode", "unspecified")));
+            profile.depthDeltaCurrentColorScale = value.value("depth_delta_current_color_scale", 0.0f);
+            profile.depthDeltaCurrentColorStrength = value.value("depth_delta_current_color_strength", 0.0f);
             profile.signalAdapter = ParseSignalAdapter(Lower(value.value("signal_adapter", "disabled")));
             profile.signals = ParseSignalMask(value.value("signals", nlohmann::json::array()));
             profile.checkerboardSignals =

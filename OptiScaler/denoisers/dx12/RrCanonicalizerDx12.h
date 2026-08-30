@@ -66,7 +66,9 @@ class CanonicalizerDx12
     bool Resize(uint32_t width, uint32_t height);
     bool Convert(const CanonicalizationDescription& description);
     bool PrepareSignalOutputs(ID3D12GraphicsCommandList* commandList, FfxRr12::SignalMask signals);
-    bool Compose(ID3D12GraphicsCommandList* commandList, FfxRr12::SignalMask signals, uint32_t debugOutput = 0);
+    bool Compose(ID3D12GraphicsCommandList* commandList, FfxRr12::SignalMask signals,
+                 RecompositionMode recompositionMode, float depthDeltaCurrentColorScale,
+                 float depthDeltaCurrentColorStrength, uint32_t debugOutput = 0);
 
     ID3D12Resource* LinearDepth() const;
     ID3D12Resource* MotionVectors() const;

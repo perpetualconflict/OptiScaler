@@ -44,6 +44,13 @@ enum class DepthDeltaSource : uint8_t
     CameraReprojection,
 };
 
+enum class RecompositionMode : uint8_t
+{
+    Unspecified,
+    Denoised,
+    DepthDeltaCurrentColor,
+};
+
 enum class SignalAdapter : uint8_t
 {
     Disabled,
@@ -63,6 +70,9 @@ struct Profile
     DepthConvention depthConvention = DepthConvention::Unspecified;
     MotionVectorDirection motionVectorDirection = MotionVectorDirection::Unspecified;
     DepthDeltaSource depthDeltaSource = DepthDeltaSource::Unspecified;
+    RecompositionMode recompositionMode = RecompositionMode::Unspecified;
+    float depthDeltaCurrentColorScale = 0.0f;
+    float depthDeltaCurrentColorStrength = 0.0f;
     SignalAdapter signalAdapter = SignalAdapter::Disabled;
     FfxRr12::SignalMask signals = 0;
     FfxRr12::SignalMask checkerboardSignals = 0;
