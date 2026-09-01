@@ -4,6 +4,7 @@
 
 #include "NVNGX_DLSS.h"
 #include "NVNGX_Parameter.h"
+#include "NgxFeatureTrace.h"
 #include "proxies/FfxApi_Proxy.h"
 #include "proxies/NVNGX_Proxy.h"
 
@@ -800,6 +801,9 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsComma
     if (tryResult == NVSDK_NGX_Result_Success)
         HandleToFeature[(*OutHandle)->Id] = InFeatureID;
 
+    const uint32_t createdHandle = (OutHandle != nullptr && *OutHandle != nullptr) ? (*OutHandle)->Id : 0;
+    NgxFeatureTrace::LogCreate(InFeatureID, createdHandle, InParameters, InCmdList, static_cast<uint32_t>(tryResult));
+
     return tryResult;
 }
 
@@ -811,6 +815,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle* 
         return NVSDK_NGX_Result_Success;
 
     auto handleId = InHandle->Id;
+    NVSDK_NGX_Feature releasedFeature = {};
+    if (const auto featureIt = HandleToFeature.find(handleId); featureIt != HandleToFeature.end())
+        releasedFeature = featureIt->second;
+    NgxFeatureTrace::LogRelease(releasedFeature, handleId);
 
     // Clean up framegen
     if (State::Instance().currentFG != nullptr && State::Instance().activeFgInput == FGInput::Upscaler)
@@ -922,6 +930,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
 
         // Some old windows 10 os version
         strcpy_s(OutSupported->MinOSVersion, "10.0.10240.16384");
+        NgxFeatureTrace::LogRequirements(FeatureDiscoveryInfo->FeatureID, true, OutSupported->FeatureSupported);
         return NVSDK_NGX_Result_Success;
     }
 
@@ -938,6 +947,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
         auto result = NVNGXProxy::D3D12_GetFeatureRequirements()(Adapter, FeatureDiscoveryInfo, OutSupported);
         LOG_DEBUG("D3D12_GetFeatureRequirements result for ({0}): {1:X}", (int) FeatureDiscoveryInfo->FeatureID,
                   (UINT) result);
+        if (OutSupported != nullptr)
+        {
+            NgxFeatureTrace::LogRequirements(
+                FeatureDiscoveryInfo->FeatureID,
+                OutSupported->FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported,
+                OutSupported->FeatureSupported);
+        }
 
         return result;
     }
@@ -947,6 +963,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
     }
 
     OutSupported->FeatureSupported = NVSDK_NGX_FeatureSupportResult_AdapterUnsupported;
+    NgxFeatureTrace::LogRequirements(FeatureDiscoveryInfo->FeatureID, false, OutSupported->FeatureSupported);
     return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
 }
 
@@ -1111,6 +1128,7 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     const Config& cfg = *Config::Instance();
 
     auto feature = HandleToFeature[handleId];
+    NgxFeatureTrace::LogEvaluate(feature, handleId, InParameters, InCmdList);
     static size_t evalWithoutFG = 0;
     bool fgCreated = std::any_of(HandleToFeature.begin(), HandleToFeature.end(),
                                  [](const auto& pair) { return pair.second == NVSDK_NGX_Feature_FrameGeneration; });

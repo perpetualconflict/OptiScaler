@@ -2972,6 +2972,13 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
         ShowHelpMarker("Expose NVIDIA DLSS Ray Reconstruction through the experimental AMD FSR-RR bridge.\n"
                        "Save settings and restart the game after changing this option.");
 
+        bool logInputs = config->FSRRLogInputs.value_or_default();
+        if (ImGui::Checkbox("Log Normalized Inputs", &logInputs))
+            config->FSRRLogInputs = logInputs;
+        ShowHelpMarker("Log SuperSampling (feature 1) and Ray Reconstruction (feature 13) create/evaluate\n"
+                       "NGX keys, raw D3D12 resource identities, extents, and formats when the inventory\n"
+                       "changes. Handles are never shared between those features.");
+
         ImGui::BeginDisabled(!enabled);
 
         bool captureOnly = config->FSRRCaptureOnly.value_or_default();
@@ -2980,12 +2987,6 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
         ShowHelpMarker("Safe validation mode: advertise Ray Reconstruction and log normalized inputs,\n"
                        "but never create or dispatch the AMD denoiser. FSR 2.1.2 remains the output path.\n"
                        "Save settings and restart the game after changing this option.");
-
-        bool logInputs = config->FSRRLogInputs.value_or_default();
-        if (ImGui::Checkbox("Log Normalized Inputs", &logInputs))
-            config->FSRRLogInputs = logInputs;
-        ShowHelpMarker("Log resource formats, extents, subrects, matrices, jitter, motion scale,\n"
-                       "and other DLSS-D metadata whenever the input layout changes.");
 
         ImGui::BeginDisabled(captureOnly);
 

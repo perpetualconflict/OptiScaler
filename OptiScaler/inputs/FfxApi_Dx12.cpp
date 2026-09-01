@@ -14,6 +14,7 @@
 #include "dx12/ffx_api_dx12.h"
 
 #include <magic_enum.hpp>
+#include <mutex>
 
 static std::unordered_map<ffxContext, ffxCreateContextDescUpscale> _initParams;
 static std::unordered_map<ffxContext, NVSDK_NGX_Parameter*> _nvParams;
@@ -578,7 +579,16 @@ ffxReturnCode_t ffxDispatch_Dx12(ffxContext* context, ffxDispatchDescHeader* des
 
     if (context == nullptr || !_initParams.contains(*context))
     {
-        LOG_INFO("Not in _contexts");
+        static std::once_flag passThroughOnce;
+        std::call_once(passThroughOnce,
+                       [desc]
+                       {
+                           LOG_INFO("NGX feature-trace: ffxDispatch_Dx12 is passing through a context OptiScaler "
+                                    "does not own (type {}). This is provider/fallback hook noise, not an FSR-RR "
+                                    "dispatch failure.",
+                                    FfxApiProxy::GetTypeName(desc->type));
+                       });
+        LOG_DEBUG("Not in _contexts");
         return FfxApiProxy::D3D12_Dispatch(context, desc);
     }
 
