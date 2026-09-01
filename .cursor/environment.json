@@ -1,5 +1,5 @@
 {
   "name": "OptiScaler",
   "user": "ubuntu",
-  "install": "bash .cursor/setup.sh"
+  "install": "bash /agent/repos/OptiScaler/.cursor/setup.sh"
 }

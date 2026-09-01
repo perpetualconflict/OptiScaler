@@ -9,8 +9,12 @@
 #   2. clang-format 20 to run the enforced style check
 #      (.github/workflows/clang-format.yml runs clang-format v20 on ubuntu-latest).
 #
-# It is intended to be run from the repository root and is safe to re-run.
+# It is safe to re-run and is independent of the caller's working directory.
 set -euo pipefail
+
+# Always operate from the OptiScaler repository root, regardless of where the
+# Cloud Agent install phase invokes this script from.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 CF_VERSION="20.1.8"
 VENV_DIR="$HOME/.venvs/optiscaler-tools"
