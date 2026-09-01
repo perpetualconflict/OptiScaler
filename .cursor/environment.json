@@ -1,0 +1,5 @@
+{
+  "name": "OptiScaler",
+  "user": "ubuntu",
+  "install": "bash .cursor/setup.sh"
+}
