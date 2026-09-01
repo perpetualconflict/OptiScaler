@@ -290,10 +290,10 @@ std::string InputSnapshot::Describe() const
             stream << "missing";
             continue;
         }
-        stream << static_cast<uint32_t>(input.description.Format) << ' ' << input.description.Width << 'x'
+        stream << "resource=0x" << std::hex << reinterpret_cast<uintptr_t>(input.resource) << std::dec << ' '
+               << static_cast<uint32_t>(input.description.Format) << ' ' << input.description.Width << 'x'
                << input.description.Height << " base=(" << input.subrectBaseX << ',' << input.subrectBaseY
-               << ") flags=0x" << std::hex
-               << static_cast<uint32_t>(input.description.Flags) << std::dec;
+               << ") flags=0x" << std::hex << static_cast<uint32_t>(input.description.Flags) << std::dec;
     }
     return stream.str();
 }

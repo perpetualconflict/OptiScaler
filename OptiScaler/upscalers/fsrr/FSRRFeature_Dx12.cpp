@@ -3,6 +3,7 @@
 #include "FSRRFeature_Dx12.h"
 
 #include <Config.h>
+#include <State.h>
 #include <Util.h>
 #include <denoisers/RrInputRegistry.h>
 #include <denoisers/RrProfile.h>
@@ -10,11 +11,14 @@
 #include <denoisers/ffx12/FfxRr12Provider.h>
 
 #include <DirectXMath.h>
+#include <sha1/sha1.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,6 +27,43 @@ namespace
 {
 using namespace DirectX;
 using namespace RayReconstruction;
+
+void LogDlssdTraceIdentity()
+{
+    if (!Config::Instance()->FSRRLogInputs.value_or_default())
+        return;
+
+    static std::once_flag once;
+    std::call_once(once,
+                   []
+                   {
+                       const auto& state = State::Instance();
+                       LOG_INFO("FSR-RR trace Streamline version: {}.{}.{}", state.streamlineVersion.major,
+                                state.streamlineVersion.minor, state.streamlineVersion.patch);
+                       if (!state.NVNGX_DLSSD_Path)
+                       {
+                           LOG_WARN("FSR-RR trace could not resolve the selected nvngx_dlssd.dll path");
+                           return;
+                       }
+
+                       const std::filesystem::path path(*state.NVNGX_DLSSD_Path);
+                       version_t version;
+                       const bool hasVersion = Util::GetFileVersion(path.wstring(), &version, nullptr);
+                       std::error_code sizeError;
+                       const auto fileSize = std::filesystem::file_size(path, sizeError);
+                       std::ifstream file(path, std::ios::binary);
+                       if (!file)
+                       {
+                           LOG_WARN("FSR-RR trace could not open selected DLSS-D binary: {}", path.string());
+                           return;
+                       }
+                       SHA1 checksum;
+                       checksum.update(file);
+                       LOG_INFO("FSR-RR trace DLSS-D binary: path={} version={}.{}.{} bytes={} sha1={}", path.string(),
+                                hasVersion ? version.major : 0, hasVersion ? version.minor : 0,
+                                hasVersion ? version.patch : 0, sizeError ? 0 : fileSize, checksum.final());
+                   });
+}
 
 constexpr auto RequiredCompositeSignals =
     FfxRr12::ToMask(FfxRr12::Signal::DirectDiffuse) |
@@ -274,6 +315,8 @@ bool FSRRFeatureDx12::InitInternal(ID3D12GraphicsCommandList* commandList, NVSDK
         LOG_INFO("FSR-RR bridge is disabled; using the FSR 2.1.2 fallback");
         return true;
     }
+
+    LogDlssdTraceIdentity();
 
     if (Config::Instance()->FSRRCaptureOnly.value_or_default())
     {
