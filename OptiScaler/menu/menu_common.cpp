@@ -2979,6 +2979,14 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
                        "NGX keys, raw D3D12 resource identities, extents, and formats when the inventory\n"
                        "changes. Handles are never shared between those features.");
 
+        bool traceOutputOrdering = config->FSRRTraceDlssdOutputOrdering.value_or_default();
+        if (ImGui::Checkbox("Trace DLSS-D Output Ordering", &traceOutputOrdering))
+            config->FSRRTraceDlssdOutputOrdering = traceOutputOrdering;
+        ShowHelpMarker("Diagnostic only: correlate feature-13 EvaluateFeature command lists with later\n"
+                       "ExecuteCommandLists submissions and look for same-list consumers of the DLSS-D\n"
+                       "output. Disabled by default. Save settings and restart. Does not enable the\n"
+                       "frame-generation descriptor tracker or change denoiser conversion.");
+
         ImGui::BeginDisabled(!enabled);
 
         bool captureOnly = config->FSRRCaptureOnly.value_or_default();

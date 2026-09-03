@@ -278,6 +278,7 @@ class Config
     CustomOptional<bool> FSRRCaptureOnly { true };
     CustomOptional<bool> FSRRDebugValidation { false };
     CustomOptional<bool> FSRRLogInputs { true };
+    CustomOptional<bool> FSRRTraceDlssdOutputOrdering { false };
     CustomOptional<int> FSRRDebugOutput { 0 };
 
     // Nukems

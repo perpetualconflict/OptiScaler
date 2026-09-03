@@ -7,6 +7,7 @@
 #include <magic_enum.hpp>
 
 #include <resource_tracking/ResTrack_Dx12.h>
+#include <inputs/DlssdOutputHazardTrace.h>
 
 #include <proxies/D3D12_Proxy.h>
 #include <proxies/XeFG_Proxy.h>
@@ -2209,6 +2210,7 @@ static void HookToDevice(ID3D12Device* InDevice)
     }
 
     HookToCommandList(InDevice);
+    DlssdOutputHazardTrace::InstallForDevice(InDevice);
 
     if (State::Instance().activeFgInput == FGInput::Upscaler &&
         !Config::Instance()->FGDisableHUDFix.value_or_default() &&
