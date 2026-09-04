@@ -74,6 +74,7 @@ $hipCommand = "call `"$devCmd`" -arch=amd64 -host_arch=amd64 -vcvars_ver=14.44 &
     "`"$hipcc`" --offload-arch=gfx1201 -std=c++20 -O2 -shared `"$hipSource`" " +
     '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_Initialize ' +
     '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_Execute ' +
+    '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_ExecuteWorkload ' +
     '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_Synchronize ' +
     '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_Destroy ' +
     '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_GetLastErrorStatus ' +
