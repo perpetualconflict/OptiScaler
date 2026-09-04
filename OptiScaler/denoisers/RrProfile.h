@@ -78,6 +78,7 @@ struct Profile
     FfxRr12::SignalMask checkerboardSignals = 0;
     float linearDepthMin = 0.0f;
     float linearDepthMax = 0.0f;
+    float specularHoldoutMaxRoughness = 0.0f;
     std::string notes;
 
     bool IsDispatchable(std::string& reason) const;

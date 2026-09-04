@@ -300,7 +300,8 @@ struct alignas(16) ConversionConstants
     std::array<float, 4> motionAndDepthBounds {};
     std::array<std::array<uint32_t, 4>, 6> inputBases {};
     uint32_t flags = 0;
-    std::array<float, 3> padding {};
+    float specularHoldoutMaxRoughness = 0.0f;
+    std::array<float, 2> padding {};
 };
 
 struct alignas(16) CompositionConstants
@@ -501,6 +502,7 @@ bool CanonicalizerDx12::Convert(const CanonicalizationDescription& description)
             };
         }
         constants.flags = description.flags;
+        constants.specularHoldoutMaxRoughness = description.specularHoldoutMaxRoughness;
 
         const uint32_t previousDepthIndex = 1u - _impl->depthWriteIndex;
         std::array<ID3D12Resource*, 13> inputs = {

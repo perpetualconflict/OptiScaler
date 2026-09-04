@@ -38,6 +38,7 @@ struct CanonicalizationDescription
     float motionScaleY = 1.0f;
     float linearDepthMin = 0.0f;
     float linearDepthMax = 0.0f;
+    float specularHoldoutMaxRoughness = 0.0f;
     std::array<float, 16> inverseView {};
     std::array<float, 16> inverseProjection {};
     std::array<float, 16> previousView {};

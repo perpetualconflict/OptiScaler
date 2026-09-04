@@ -19,7 +19,8 @@
       "checkerboard_signals": [],
       "linear_depth_min": 0.01,
       "linear_depth_max": 10000.0,
-      "notes": "The proof's no-distance diffuse channel maps to FSR-RR 1.2 direct diffuse; its specular channel remains indirect and uses Cyberpunk's specular hit distance. Camera-reprojected depth delta with a 0.5 scale and 0.85 current-color strength removed moving-object trails in a live A/B. Deliberately disabled until the full adapter is capture-validated."
+      "specular_holdout_max_roughness": 0.2,
+      "notes": "The proof's no-distance diffuse channel maps to FSR-RR 1.2 direct diffuse; its specular channel remains indirect and uses Cyberpunk's specular hit distance. Camera-reprojected depth delta with a 0.5 scale and 0.85 current-color strength removed moving-object trails in a live A/B. Specular holdout of 0.2 matches the proof's roughness gate and keeps invalid or rough specular in residual so the denoiser cannot smear it. Deliberately disabled until the full adapter is capture-validated."
     }
   ]
 }

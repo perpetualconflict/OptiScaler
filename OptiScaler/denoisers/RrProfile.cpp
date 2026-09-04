@@ -148,6 +148,9 @@ bool Profile::IsDispatchable(std::string& reason) const
         reason = "checkerboard signal mask is not a subset of active signals";
     else if (!(linearDepthMin >= 0.0f && linearDepthMin < linearDepthMax))
         reason = "linear depth bounds are invalid";
+    else if (!std::isfinite(specularHoldoutMaxRoughness) || specularHoldoutMaxRoughness < 0.0f ||
+             specularHoldoutMaxRoughness > 1.0f)
+        reason = "specular holdout roughness is invalid";
     else
     {
         reason.clear();
@@ -197,6 +200,7 @@ bool ProfileDatabase::Load(const std::filesystem::path& path)
                 ParseSignalMask(value.value("checkerboard_signals", nlohmann::json::array()));
             profile.linearDepthMin = value.value("linear_depth_min", 0.0f);
             profile.linearDepthMax = value.value("linear_depth_max", 0.0f);
+            profile.specularHoldoutMaxRoughness = value.value("specular_holdout_max_roughness", 0.0f);
             profile.notes = value.value("notes", "");
             _profiles.push_back(std::move(profile));
         }

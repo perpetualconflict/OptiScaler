@@ -45,6 +45,10 @@ foreach ($profile in $document.profiles) {
     if ($profile.linear_depth_min -lt 0 -or $profile.linear_depth_min -ge $profile.linear_depth_max) {
         throw "Profile '$($profile.id)' has invalid linear depth bounds."
     }
+    if ($null -ne $profile.PSObject.Properties['specular_holdout_max_roughness'] -and
+        ($profile.specular_holdout_max_roughness -lt 0 -or $profile.specular_holdout_max_roughness -gt 1)) {
+        throw "Profile '$($profile.id)' must use a specular holdout roughness in [0, 1]."
+    }
     if ($profile.recomposition_mode -notin $knownRecompositionModes) {
         throw "Profile '$($profile.id)' names unknown recomposition mode '$($profile.recomposition_mode)'."
     }

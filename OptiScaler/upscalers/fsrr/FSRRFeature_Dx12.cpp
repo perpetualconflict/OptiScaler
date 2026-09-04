@@ -382,10 +382,10 @@ bool FSRRFeatureDx12::InitInternal(ID3D12GraphicsCommandList* commandList, NVSDK
     LOG_INFO(
         "FSR-RR bridge armed with provider {}.{}.{} ({}) and profile '{}' "
         "(depth_delta_source={}, recomposition={}, depth_delta_current_color_scale={}, "
-        "depth_delta_current_color_strength={})",
+        "depth_delta_current_color_strength={}, specular_holdout_max_roughness={})",
         version.major, version.minor, version.patch, version.name, _impl->profile->id, depthDeltaSource,
         recompositionMode, _impl->profile->depthDeltaCurrentColorScale,
-        _impl->profile->depthDeltaCurrentColorStrength);
+        _impl->profile->depthDeltaCurrentColorStrength, _impl->profile->specularHoldoutMaxRoughness);
     parameters->Set("SuperSamplingDenoising.Available", 1);
     parameters->Set("SuperSamplingDenoising.FeatureInitResult", static_cast<uint32_t>(NVSDK_NGX_Result_Success));
     _impl->bridgeReady = true;
@@ -537,6 +537,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         conversion.motionScaleY = snapshot.motionScaleY;
         conversion.linearDepthMin = _impl->profile->linearDepthMin;
         conversion.linearDepthMax = _impl->profile->linearDepthMax;
+        conversion.specularHoldoutMaxRoughness = _impl->profile->specularHoldoutMaxRoughness;
         conversion.inverseView = inverseView;
         conversion.inverseProjection = inverseProjection;
         conversion.previousView = previousView;

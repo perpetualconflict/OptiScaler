@@ -47,7 +47,8 @@ cbuffer Constants : register(b0)
     uint4 InputBase89;
     uint4 InputBase1011;
     uint Flags;
-    float3 Padding;
+    float SpecularHoldoutMaxRoughness;
+    float2 Padding;
 };
 
 static const uint FlagHardwareDepth = 1u << 0;
@@ -207,6 +208,17 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
                                     : -1.0f;
     if (!splitValid || !isfinite(specularHitDistance))
         specularHitDistance = -1.0f;
+    // The albedo split is lossless, so residual is otherwise ~0 and volumetrics /
+    // untrackable specular stay in the denoiser. Hold those pixels out: invalid
+    // or non-positive hitT, or roughness at/above the profile threshold.
+    bool specularHitUsable = specularHitDistance > 0.0f;
+    bool holdOutSpecular = !specularHitUsable ||
+                           (SpecularHoldoutMaxRoughness > 0.0f && roughness >= SpecularHoldoutMaxRoughness);
+    if (holdOutSpecular)
+    {
+        specularIllumination = 0.0f;
+        specularHitDistance = -1.0f;
+    }
     float directDiffuseValidity = splitValid ? 0.0f : -1.0f;
     OutDirectDiffuse[pixel] = float4(diffuseIllumination, directDiffuseValidity);
     OutIndirectSpecular[pixel] = float4(specularIllumination, specularHitDistance);

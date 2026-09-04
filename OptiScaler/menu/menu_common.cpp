@@ -3032,7 +3032,10 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
         if (ImGui::Combo("Debug Output", &debugOutput, debugOutputs, IM_ARRAYSIZE(debugOutputs)))
             config->FSRRDebugOutput = debugOutput;
         ShowHelpMarker("Select which intermediate image is sent through the upscaler.\n"
-                       "Only applies when capture-only mode is disabled and FSR-RR dispatch succeeds.");
+                       "Only applies when capture-only mode is disabled and FSR-RR dispatch succeeds.\n"
+                       "Next A/B after specular holdout: Recomposed Result, Denoised Specular,\n"
+                       "Residual / Skipped Color, Full Current Color. Residual should no longer\n"
+                       "be black if untrackable specular is being held out.");
 
         ImGui::EndDisabled();
         ImGui::EndDisabled();
