@@ -2987,6 +2987,14 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
                        "output. Disabled by default. Save settings and restart. Does not enable the\n"
                        "frame-generation descriptor tracker or change denoiser conversion.");
 
+        bool testQueueRendezvous = config->FSRRTestDlssdQueueRendezvous.value_or_default();
+        if (ImGui::Checkbox("Test DLSS-D Queue Rendezvous", &testQueueRendezvous))
+            config->FSRRTestDlssdQueueRendezvous = testQueueRendezvous;
+        ShowHelpMarker("High-risk diagnostic: append a bounded D3D12 ready/wait pair after feature-13\n"
+                       "evaluation and run a deterministic HIP payload from ExecuteCommandLists. It does\n"
+                       "not touch DLSS-D image data and disables itself after any timeout or mismatch.\n"
+                       "Save settings and restart the game.");
+
         ImGui::BeginDisabled(!enabled);
 
         bool captureOnly = config->FSRRCaptureOnly.value_or_default();

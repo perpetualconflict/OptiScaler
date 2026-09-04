@@ -51,3 +51,36 @@ try {
 finally {
     & subst $drive /d 2>$null
 }
+
+# Build the small, diagnostic-only HIP companion after the normal package has
+# been produced. It targets RDNA 4 and relies on the AMD driver HIP runtime;
+# no ROCm runtime binary is redistributed with OptiScaler.
+$hipRoot = 'C:\Program Files\AMD\ROCm\7.1'
+$hipcc = Join-Path $hipRoot 'bin\hipcc.exe'
+$hipSource = Join-Path $repoRoot 'native\dlssd_queue_rendezvous_hip.cpp'
+$hipOutputDirectory = Join-Path $repoRoot 'x64\Release\a\OptiScaler'
+$hipOutput = Join-Path $hipOutputDirectory 'DlssdQueueRendezvousHip.dll'
+$vsInstall = & $vswhere -latest -version '[17.0,19.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath |
+    Select-Object -First 1
+$devCmd = if ($vsInstall) { Join-Path $vsInstall 'Common7\Tools\VsDevCmd.bat' } else { $null }
+if (-not (Test-Path -LiteralPath $hipcc)) {
+    throw "HIP compiler was not found at $hipcc. The queue-rendezvous diagnostic companion cannot be built."
+}
+if (-not $devCmd -or -not (Test-Path -LiteralPath $devCmd)) {
+    throw 'Visual Studio developer environment was not found for the HIP companion build.'
+}
+New-Item -ItemType Directory -Force -Path $hipOutputDirectory | Out-Null
+$hipCommand = "call `"$devCmd`" -arch=amd64 -host_arch=amd64 -vcvars_ver=14.44 && " +
+    "`"$hipcc`" --offload-arch=gfx1201 -std=c++20 -O2 -shared `"$hipSource`" " +
+    '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_Initialize ' +
+    '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_Execute ' +
+    '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_Synchronize ' +
+    '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_Destroy ' +
+    '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_GetLastErrorStatus ' +
+    '-Xlinker /EXPORT:DLSSD_RENDEZVOUS_GetLastErrorText ' +
+    "-o `"$hipOutput`""
+& cmd.exe /d /c $hipCommand
+if ($LASTEXITCODE -ne 0) {
+    throw 'DLSS-D queue-rendezvous HIP companion build failed.'
+}
+Write-Host "DLSS-D queue-rendezvous HIP companion built at $hipOutput"

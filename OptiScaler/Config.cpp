@@ -391,6 +391,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             FSRRDebugValidation.set_from_config(readBool("FSRR", "DebugValidation"));
             FSRRLogInputs.set_from_config(readBool("FSRR", "LogInputs"));
             FSRRTraceDlssdOutputOrdering.set_from_config(readBool("FSRR", "TraceDlssdOutputOrdering"));
+            FSRRTestDlssdQueueRendezvous.set_from_config(readBool("FSRR", "TestDlssdQueueRendezvous"));
             if (auto setting = readInt("FSRR", "DebugOutput"); setting && *setting >= 0 && *setting <= 20)
                 FSRRDebugOutput.set_from_config(setting);
         }
@@ -1200,6 +1201,8 @@ bool Config::SaveIni()
         ini.SetValue("FSRR", "LogInputs", GetBoolValue(Instance()->FSRRLogInputs.value_for_config()).c_str());
         ini.SetValue("FSRR", "TraceDlssdOutputOrdering",
                      GetBoolValue(Instance()->FSRRTraceDlssdOutputOrdering.value_for_config()).c_str());
+        ini.SetValue("FSRR", "TestDlssdQueueRendezvous",
+                     GetBoolValue(Instance()->FSRRTestDlssdQueueRendezvous.value_for_config()).c_str());
         ini.SetValue("FSRR", "DebugOutput", GetIntValue(Instance()->FSRRDebugOutput.value_for_config()).c_str());
     }
 

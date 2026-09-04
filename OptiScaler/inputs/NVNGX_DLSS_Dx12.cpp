@@ -6,6 +6,7 @@
 #include "NVNGX_Parameter.h"
 #include "NgxFeatureTrace.h"
 #include "DlssdOutputHazardTrace.h"
+#include "DlssdQueueRendezvous.h"
 #include "proxies/FfxApi_Proxy.h"
 #include "proxies/NVNGX_Proxy.h"
 
@@ -1008,7 +1009,11 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
         return NVSDK_NGX_Result_Success;
 
     // Root signature restoration setup
-    const bool restoreCompute = cfg.RestoreComputeSignature.value_or_default();
+    const bool queueRendezvous = HandleToFeature[handleId] == NVSDK_NGX_Feature_RayReconstruction &&
+                                 DlssdQueueRendezvous::Enabled();
+    // The diagnostic appends its own compute root signature at the feature tail.
+    // Force restoration while it is active even when the general hotfix is off.
+    const bool restoreCompute = cfg.RestoreComputeSignature.value_or_default() || queueRendezvous;
     const bool restoreGraphics = cfg.RestoreGraphicSignature.value_or_default();
     const bool shouldRestoreSigs = restoreCompute || restoreGraphics;
 
@@ -1093,6 +1098,11 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
     {
         LOG_ERROR("Feature evaluation failed for '{}'", feature->Name());
         ImGui::InsertNotification({ ImGuiToastType::Error, 10000, "Upscaler failed to run!" });
+    }
+
+    else if (queueRendezvous)
+    {
+        (void) DlssdQueueRendezvous::RecordEvaluateTail(handleId, InCmdList);
     }
 
     // Restore root signatures

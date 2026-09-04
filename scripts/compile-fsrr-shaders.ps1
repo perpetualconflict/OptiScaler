@@ -27,13 +27,26 @@ $shaders = @(
         Source = 'RrCompose.hlsl'
         Header = 'RrCompose_Shader.h'
         Variable = 'RrCompose_cso'
+    },
+    @{
+        Source = 'DlssdQueueRendezvous.hlsl'
+        Header = 'DlssdQueueRendezvousSignal_Shader.h'
+        Variable = 'DlssdQueueRendezvousSignal_cso'
+        Entry = 'SignalReadyCS'
+    },
+    @{
+        Source = 'DlssdQueueRendezvous.hlsl'
+        Header = 'DlssdQueueRendezvousWait_Shader.h'
+        Variable = 'DlssdQueueRendezvousWait_cso'
+        Entry = 'WaitDoneCS'
     }
 )
 
 foreach ($shader in $shaders) {
     $source = Join-Path $shaderRoot $shader.Source
     $header = Join-Path $shaderRoot $shader.Header
-    & $fxc /nologo /T cs_5_1 /E CSMain /O3 /Fh $header /Vn $shader.Variable $source
+    $entry = if ($shader.Entry) { $shader.Entry } else { 'CSMain' }
+    & $fxc /nologo /T cs_5_1 /E $entry /O3 /Fh $header /Vn $shader.Variable $source
     if ($LASTEXITCODE -ne 0) {
         throw "Shader compilation failed for $($shader.Source)."
     }

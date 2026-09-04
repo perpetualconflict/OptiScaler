@@ -1,6 +1,7 @@
 #include "pch.h"
 
 #include "DlssdOutputHazardTrace.h"
+#include "DlssdQueueRendezvous.h"
 
 #include <Config.h>
 #include <State.h>
@@ -750,12 +751,23 @@ void ObserveCloseLocked(ID3D12GraphicsCommandList* commandList)
 
 void hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists, ID3D12CommandList* const* ppCommandLists)
 {
-    if (!State::Instance().isShuttingDown && ppCommandLists != nullptr && NumCommandLists > 0)
+    // The experimental rendezvous deliberately serializes only instrumented
+    // queue submissions. Its HIP waiter must be enqueued immediately before the
+    // matching D3D12 submission, with no other probe submission interleaved.
+    static std::mutex rendezvousSubmissionMutex;
+    std::unique_lock rendezvousLock(rendezvousSubmissionMutex, std::defer_lock);
+    if (DlssdQueueRendezvous::SubmissionContainsProbe(NumCommandLists, ppCommandLists))
+        rendezvousLock.lock();
+
+    const uint64_t rendezvousToken = DlssdQueueRendezvous::BeforeExecuteCommandLists(
+        This, NumCommandLists, ppCommandLists);
+    if (Enabled() && !State::Instance().isShuttingDown && ppCommandLists != nullptr && NumCommandLists > 0)
     {
         std::lock_guard lock(StateMutex);
         ObserveExecuteLocked(This, NumCommandLists, ppCommandLists);
     }
     o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+    DlssdQueueRendezvous::AfterExecuteCommandLists(This, rendezvousToken);
 }
 
 void hkResourceBarrier(ID3D12GraphicsCommandList* This, UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers)
@@ -1158,30 +1170,33 @@ void InstallHooksLocked(ID3D12Device* device)
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
     Attach(reinterpret_cast<PVOID*>(&o_ExecuteCommandLists), hkExecuteCommandLists);
-    Attach(reinterpret_cast<PVOID*>(&o_ResourceBarrier), hkResourceBarrier);
-    Attach(reinterpret_cast<PVOID*>(&o_CopyResource), hkCopyResource);
-    Attach(reinterpret_cast<PVOID*>(&o_CopyTextureRegion), hkCopyTextureRegion);
-    Attach(reinterpret_cast<PVOID*>(&o_CopyBufferRegion), hkCopyBufferRegion);
-    Attach(reinterpret_cast<PVOID*>(&o_ResolveSubresource), hkResolveSubresource);
-    Attach(reinterpret_cast<PVOID*>(&o_Dispatch), hkDispatch);
-    Attach(reinterpret_cast<PVOID*>(&o_DrawInstanced), hkDrawInstanced);
-    Attach(reinterpret_cast<PVOID*>(&o_DrawIndexedInstanced), hkDrawIndexedInstanced);
-    Attach(reinterpret_cast<PVOID*>(&o_ExecuteIndirect), hkExecuteIndirect);
-    Attach(reinterpret_cast<PVOID*>(&o_ExecuteBundle), hkExecuteBundle);
-    Attach(reinterpret_cast<PVOID*>(&o_Close), hkClose);
-    Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootDescriptorTable), hkSetComputeRootDescriptorTable);
-    Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootDescriptorTable), hkSetGraphicsRootDescriptorTable);
-    Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootSRV), hkSetComputeRootSRV);
-    Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootUAV), hkSetComputeRootUAV);
-    Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootSRV), hkSetGraphicsRootSRV);
-    Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootUAV), hkSetGraphicsRootUAV);
-    Attach(reinterpret_cast<PVOID*>(&o_OMSetRenderTargets), hkOMSetRenderTargets);
-    Attach(reinterpret_cast<PVOID*>(&o_CreateDescriptorHeap), hkCreateDescriptorHeap);
-    Attach(reinterpret_cast<PVOID*>(&o_CreateShaderResourceView), hkCreateShaderResourceView);
-    Attach(reinterpret_cast<PVOID*>(&o_CreateUnorderedAccessView), hkCreateUnorderedAccessView);
-    Attach(reinterpret_cast<PVOID*>(&o_CreateRenderTargetView), hkCreateRenderTargetView);
-    Attach(reinterpret_cast<PVOID*>(&o_CopyDescriptors), hkCopyDescriptors);
-    Attach(reinterpret_cast<PVOID*>(&o_CopyDescriptorsSimple), hkCopyDescriptorsSimple);
+    if (Enabled())
+    {
+        Attach(reinterpret_cast<PVOID*>(&o_ResourceBarrier), hkResourceBarrier);
+        Attach(reinterpret_cast<PVOID*>(&o_CopyResource), hkCopyResource);
+        Attach(reinterpret_cast<PVOID*>(&o_CopyTextureRegion), hkCopyTextureRegion);
+        Attach(reinterpret_cast<PVOID*>(&o_CopyBufferRegion), hkCopyBufferRegion);
+        Attach(reinterpret_cast<PVOID*>(&o_ResolveSubresource), hkResolveSubresource);
+        Attach(reinterpret_cast<PVOID*>(&o_Dispatch), hkDispatch);
+        Attach(reinterpret_cast<PVOID*>(&o_DrawInstanced), hkDrawInstanced);
+        Attach(reinterpret_cast<PVOID*>(&o_DrawIndexedInstanced), hkDrawIndexedInstanced);
+        Attach(reinterpret_cast<PVOID*>(&o_ExecuteIndirect), hkExecuteIndirect);
+        Attach(reinterpret_cast<PVOID*>(&o_ExecuteBundle), hkExecuteBundle);
+        Attach(reinterpret_cast<PVOID*>(&o_Close), hkClose);
+        Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootDescriptorTable), hkSetComputeRootDescriptorTable);
+        Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootDescriptorTable), hkSetGraphicsRootDescriptorTable);
+        Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootSRV), hkSetComputeRootSRV);
+        Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootUAV), hkSetComputeRootUAV);
+        Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootSRV), hkSetGraphicsRootSRV);
+        Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootUAV), hkSetGraphicsRootUAV);
+        Attach(reinterpret_cast<PVOID*>(&o_OMSetRenderTargets), hkOMSetRenderTargets);
+        Attach(reinterpret_cast<PVOID*>(&o_CreateDescriptorHeap), hkCreateDescriptorHeap);
+        Attach(reinterpret_cast<PVOID*>(&o_CreateShaderResourceView), hkCreateShaderResourceView);
+        Attach(reinterpret_cast<PVOID*>(&o_CreateUnorderedAccessView), hkCreateUnorderedAccessView);
+        Attach(reinterpret_cast<PVOID*>(&o_CreateRenderTargetView), hkCreateRenderTargetView);
+        Attach(reinterpret_cast<PVOID*>(&o_CopyDescriptors), hkCopyDescriptors);
+        Attach(reinterpret_cast<PVOID*>(&o_CopyDescriptorsSimple), hkCopyDescriptorsSimple);
+    }
 
     const LONG error = DetourTransactionCommit();
     if (error != NO_ERROR)
@@ -1192,7 +1207,8 @@ void InstallHooksLocked(ID3D12Device* device)
     }
 
     HooksInstalled = true;
-    LOG_INFO("DLSS-D output-order: installed feature-13 command-list and ExecuteCommandLists hooks");
+    LOG_INFO("DLSS-D diagnostics: installed ExecuteCommandLists hook (output-order={}, rendezvous={})", Enabled(),
+             DlssdQueueRendezvous::Enabled());
 }
 } // namespace
 
@@ -1200,7 +1216,11 @@ bool Enabled() { return Config::Instance()->FSRRTraceDlssdOutputOrdering.value_o
 
 void InstallForDevice(ID3D12Device* device)
 {
-    if (!Enabled() || device == nullptr)
+    if (device == nullptr)
+        return;
+
+    DlssdQueueRendezvous::InstallForDevice(device);
+    if (!Enabled() && !DlssdQueueRendezvous::Enabled())
         return;
 
     std::lock_guard lock(StateMutex);
@@ -1215,7 +1235,7 @@ void InstallForDevice(ID3D12Device* device)
 
 void OnCreate(uint32_t handleId, NVSDK_NGX_Feature featureId, ID3D12GraphicsCommandList* commandList)
 {
-    if (!Enabled() || featureId != NVSDK_NGX_Feature_RayReconstruction || handleId == 0)
+    if (featureId != NVSDK_NGX_Feature_RayReconstruction || handleId == 0)
         return;
 
     if (commandList != nullptr)
@@ -1227,6 +1247,9 @@ void OnCreate(uint32_t handleId, NVSDK_NGX_Feature featureId, ID3D12GraphicsComm
             device->Release();
         }
     }
+
+    if (!Enabled())
+        return;
 
     std::lock_guard lock(StateMutex);
     auto& handle = Handles[handleId];
@@ -1250,6 +1273,7 @@ void OnRelease(uint32_t handleId)
 
 void Shutdown()
 {
+    DlssdQueueRendezvous::Shutdown();
     if (!Enabled())
         return;
 
