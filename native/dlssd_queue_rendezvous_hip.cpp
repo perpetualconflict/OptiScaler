@@ -8,10 +8,12 @@
 
 #include <hip/hip_runtime.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
 #include <new>
+#include <thread>
 
 #define DLSSD_RENDEZVOUS_EXPORT
 
@@ -21,7 +23,9 @@ constexpr std::uint32_t kStatusInvalidArgument = 0xE0020001u;
 constexpr std::uint32_t kStatusAdapterMismatch = 0xE0020002u;
 constexpr std::uint32_t kStatusAllocationFailed = 0xE0020003u;
 constexpr std::uint32_t kStatusInvalidToken = 0xE0020004u;
+constexpr std::uint32_t kStatusKernelStartTimedOut = 0xE0020005u;
 constexpr std::uint32_t kTokenMagic = 0x565A4452u; // RDZV
+constexpr auto kKernelStartTimeout = std::chrono::milliseconds(1000);
 
 constexpr std::uint32_t kReadyWord = 0;
 constexpr std::uint32_t kDoneWord = 1;
@@ -41,6 +45,8 @@ struct Token
     std::uint32_t magic = kTokenMagic;
     hipExternalMemory_t externalMemory = nullptr;
     std::uint32_t* words = nullptr;
+    std::uint32_t* armDevice = nullptr;
+    hipEvent_t armEvent = nullptr;
     std::uint64_t size = 0;
 };
 
@@ -81,6 +87,12 @@ __device__ std::uint32_t make_payload(std::uint32_t sequence, std::uint32_t work
         value ^= value >> 16;
     }
     return value;
+}
+
+__global__ void arm_kernel(std::uint32_t* armedWord, std::uint32_t sequence)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *armedWord = sequence;
 }
 
 __global__ void rendezvous_kernel(std::uint32_t* words, std::uint32_t baseWord, std::uint32_t sequence,
@@ -210,6 +222,26 @@ extern "C" DLSSD_RENDEZVOUS_EXPORT std::uint32_t __cdecl DLSSD_RENDEZVOUS_Initia
     token->externalMemory = externalMemory;
     token->words = static_cast<std::uint32_t*>(mapped);
     token->size = size;
+
+    result = hipMalloc(&token->armDevice, sizeof(std::uint32_t));
+    if (result != hipSuccess || token->armDevice == nullptr)
+    {
+        (void) hipFree(token->words);
+        (void) hipDestroyExternalMemory(token->externalMemory);
+        delete token;
+        return result != hipSuccess ? set_hip_error("hipMalloc(rendezvous arm)", result)
+                                    : set_error(kStatusAllocationFailed, "null rendezvous arm allocation");
+    }
+    result = hipEventCreateWithFlags(&token->armEvent, hipEventDisableTiming);
+    if (result != hipSuccess || token->armEvent == nullptr)
+    {
+        (void) hipFree(token->armDevice);
+        (void) hipFree(token->words);
+        (void) hipDestroyExternalMemory(token->externalMemory);
+        delete token;
+        return result != hipSuccess ? set_hip_error("hipEventCreateWithFlags(rendezvous arm)", result)
+                                    : set_error(kStatusAllocationFailed, "null rendezvous arm event");
+    }
     *lifetimeToken = token;
     return success();
 }
@@ -226,10 +258,26 @@ extern "C" DLSSD_RENDEZVOUS_EXPORT std::uint32_t __cdecl DLSSD_RENDEZVOUS_Execut
         return set_error(kStatusInvalidToken, "invalid rendezvous execution token or bounds");
     }
 
-    rendezvous_kernel<<<1, 1>>>(token->words, baseWord, sequence, maxWaitIterations, workIterations);
+    arm_kernel<<<1, 1>>>(token->armDevice, sequence);
     hipError_t result = hipGetLastError();
     if (result != hipSuccess)
+        return set_hip_error("rendezvous arm kernel launch", result);
+    result = hipEventRecord(token->armEvent, nullptr);
+    if (result != hipSuccess)
+        return set_hip_error("hipEventRecord(rendezvous arm)", result);
+    rendezvous_kernel<<<1, 1>>>(token->words, baseWord, sequence, maxWaitIterations, workIterations);
+    result = hipGetLastError();
+    if (result != hipSuccess)
         return set_hip_error("rendezvous kernel launch", result);
+
+    const auto deadline = std::chrono::steady_clock::now() + kKernelStartTimeout;
+    while ((result = hipEventQuery(token->armEvent)) == hipErrorNotReady &&
+           std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    if (result == hipErrorNotReady)
+        return set_error(kStatusKernelStartTimedOut, "rendezvous kernel did not arm before D3D12 submission");
+    if (result != hipSuccess)
+        return set_hip_error("hipEventQuery(rendezvous arm)", result);
     return success();
 }
 
@@ -260,6 +308,18 @@ extern "C" DLSSD_RENDEZVOUS_EXPORT std::uint32_t __cdecl DLSSD_RENDEZVOUS_Destro
         result = hipFree(token->words);
         if (result != hipSuccess && finalStatus == 0)
             finalStatus = set_hip_error("hipFree(external mapping)", result);
+    }
+    if (token->armEvent != nullptr)
+    {
+        result = hipEventDestroy(token->armEvent);
+        if (result != hipSuccess && finalStatus == 0)
+            finalStatus = set_hip_error("hipEventDestroy(rendezvous arm)", result);
+    }
+    if (token->armDevice != nullptr)
+    {
+        result = hipFree(token->armDevice);
+        if (result != hipSuccess && finalStatus == 0)
+            finalStatus = set_hip_error("hipFree(rendezvous arm)", result);
     }
     if (token->externalMemory != nullptr)
     {

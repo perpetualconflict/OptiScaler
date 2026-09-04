@@ -1009,13 +1009,15 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
         return NVSDK_NGX_Result_Success;
 
     // Root signature restoration setup
-    const bool queueRendezvous = HandleToFeature[handleId] == NVSDK_NGX_Feature_RayReconstruction &&
-                                 DlssdQueueRendezvous::Enabled();
+    bool queueRendezvous = HandleToFeature[handleId] == NVSDK_NGX_Feature_RayReconstruction &&
+                           DlssdQueueRendezvous::Enabled();
     // The diagnostic appends its own compute root signature at the feature tail.
     // Force restoration while it is active even when the general hotfix is off.
+    const bool configuredRestore = cfg.RestoreComputeSignature.value_or_default() ||
+                                   cfg.RestoreGraphicSignature.value_or_default();
     const bool restoreCompute = cfg.RestoreComputeSignature.value_or_default() || queueRendezvous;
     const bool restoreGraphics = cfg.RestoreGraphicSignature.value_or_default();
-    const bool shouldRestoreSigs = restoreCompute || restoreGraphics;
+    bool shouldRestoreSigs = restoreCompute || restoreGraphics;
 
     if (shouldRestoreSigs)
     {
@@ -1023,8 +1025,23 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
 
         if (!D3D12Hooks::CanRestoreRootSignature(InCmdList))
         {
-            LOG_DEBUG("Skipping upscaling because can't restore root signature");
-            return NVSDK_NGX_Result_Success;
+            if (queueRendezvous && !configuredRestore)
+            {
+                static std::atomic_bool loggedMissingRendezvousRestore = false;
+                if (!loggedMissingRendezvousRestore.exchange(true))
+                {
+                    LOG_WARN("DLSS-D rendezvous: no caller root signature snapshot for command list {:X}; skipping "
+                             "only the synthetic probe and continuing normal feature evaluation",
+                             (UINT64) InCmdList);
+                }
+                queueRendezvous = false;
+                shouldRestoreSigs = false;
+            }
+            else
+            {
+                LOG_DEBUG("Skipping upscaling because can't restore root signature");
+                return NVSDK_NGX_Result_Success;
+            }
         }
     }
 

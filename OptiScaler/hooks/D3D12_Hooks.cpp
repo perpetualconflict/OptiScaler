@@ -8,6 +8,7 @@
 
 #include <resource_tracking/ResTrack_Dx12.h>
 #include <inputs/DlssdOutputHazardTrace.h>
+#include <inputs/DlssdQueueRendezvous.h>
 
 #include <proxies/D3D12_Proxy.h>
 #include <proxies/XeFG_Proxy.h>
@@ -63,6 +64,11 @@ static PFN_Release o_D3D12DeviceRelease = nullptr;
 static bool _creatingD3D12Device = false;
 static bool _d3d12Captured = false;
 static LUID _lastAdapterLuid = {};
+
+static bool RestoreComputeRootSignatureEnabled()
+{
+    return Config::Instance()->RestoreComputeSignature.value_or_default() || DlssdQueueRendezvous::Enabled();
+}
 
 // Common
 using PFN_SetDescriptorHeaps = rewrite_signature<decltype(&ID3D12GraphicsCommandList::SetDescriptorHeaps)>::type;
@@ -419,8 +425,8 @@ UINT GetRootParameterCount(ID3D12RootSignature* pRootSignature)
 VALIDATE_HOOK(hkSetComputeRootSignature, PFN_SetComputeRootSignature)
 static void hkSetComputeRootSignature(ID3D12GraphicsCommandList* commandList, ID3D12RootSignature* pRootSignature)
 {
-    if (!lateInProgressSetComputeRootSignature && Config::Instance()->RestoreComputeSignature.value_or_default() &&
-        !isUpscalerActive && commandList != nullptr && pRootSignature != nullptr)
+    if (!lateInProgressSetComputeRootSignature && RestoreComputeRootSignatureEnabled() && !isUpscalerActive &&
+        commandList != nullptr && pRootSignature != nullptr)
     {
         {
             auto paramCount = GetRootParameterCount(pRootSignature);
@@ -727,7 +733,7 @@ static void hkSetComputeRootSignatureLate(ID3D12GraphicsCommandList* commandList
 {
     lateInProgressSetComputeRootSignature = true;
 
-    if (Config::Instance()->RestoreComputeSignature.value_or_default() && !isUpscalerActive && commandList != nullptr &&
+    if (RestoreComputeRootSignatureEnabled() && !isUpscalerActive && commandList != nullptr &&
         pRootSignature != nullptr)
     {
         {
@@ -1047,7 +1053,7 @@ void D3D12Hooks::HookToCommandListLate(ID3D12GraphicsCommandList* commandList)
     // Get the vtable pointer
     PVOID* pVTable = *(PVOID**) commandList;
 
-    const bool restoreComputeSignature = Config::Instance()->RestoreComputeSignature.value_or_default();
+    const bool restoreComputeSignature = RestoreComputeRootSignatureEnabled();
     const bool restoreGraphicSignature = Config::Instance()->RestoreGraphicSignature.value_or_default();
     const bool extendedRestoreSignature = Config::Instance()->ExtendedStateRestore.value_or_default();
 
@@ -2549,7 +2555,7 @@ bool D3D12Hooks::RestoreGraphicsRootState(ID3D12GraphicsCommandList* cmdList)
 
 void D3D12Hooks::RestoreRoot(ID3D12GraphicsCommandList* cmdList)
 {
-    const bool restoreComputeSignature = Config::Instance()->RestoreComputeSignature.value_or_default();
+    const bool restoreComputeSignature = RestoreComputeRootSignatureEnabled();
     const bool restoreGraphicSignature = Config::Instance()->RestoreGraphicSignature.value_or_default();
 
     if (restoreComputeSignature || restoreGraphicSignature)

@@ -1224,7 +1224,7 @@ void InstallForDevice(ID3D12Device* device)
         return;
 
     std::lock_guard lock(StateMutex);
-    if (!LoggedEnable)
+    if (Enabled() && !LoggedEnable)
     {
         LoggedEnable = true;
         LogDisclaimerOnce();
