@@ -35,6 +35,7 @@ HMODULE gCallerShim = nullptr;
 PFN_DlssdRuntime_Attach gAttach = nullptr;
 PFN_DlssdRuntime_PrepareAttach gPrepareAttach = nullptr;
 PFN_DlssdRuntime_FinishAttach gFinishAttach = nullptr;
+PFN_DlssdRuntime_CreateProgress gCreateProgress = nullptr;
 PFN_DlssdRuntime_Evaluate gEvaluate = nullptr;
 PFN_DlssdRuntime_Release gRelease = nullptr;
 PFN_DlssdRuntime_LastError gLastError = nullptr;
@@ -131,6 +132,11 @@ bool LoadRuntime(const char** error)
         reinterpret_cast<PFN_DlssdRuntime_PrepareAttach>(GetProcAddress(gModule, "DlssdRuntime_PrepareAttach"));
     gFinishAttach =
         reinterpret_cast<PFN_DlssdRuntime_FinishAttach>(GetProcAddress(gModule, "DlssdRuntime_FinishAttach"));
+    // Optional progress export for the host create watchdog. Older sidecar
+    // DLLs lack it; a missing export only disables stall detection, never
+    // attach itself.
+    gCreateProgress =
+        reinterpret_cast<PFN_DlssdRuntime_CreateProgress>(GetProcAddress(gModule, "DlssdRuntime_CreateProgress"));
     gEvaluate = reinterpret_cast<PFN_DlssdRuntime_Evaluate>(GetProcAddress(gModule, "DlssdRuntime_Evaluate"));
     gRelease = reinterpret_cast<PFN_DlssdRuntime_Release>(GetProcAddress(gModule, "DlssdRuntime_Release"));
     gLastError = reinterpret_cast<PFN_DlssdRuntime_LastError>(GetProcAddress(gModule, "DlssdRuntime_LastError"));
@@ -156,6 +162,7 @@ bool LoadRuntime(const char** error)
         gAttach = nullptr;
         gPrepareAttach = nullptr;
         gFinishAttach = nullptr;
+        gCreateProgress = nullptr;
         gEvaluate = nullptr;
         gRelease = nullptr;
         gLastError = nullptr;
@@ -623,28 +630,6 @@ void Release()
     std::unique_lock lock(gLock);
     if (gAbandoned.load(std::memory_order_acquire))
     {
-        // Dump verdict 2026-09-07: by process exit the hung owner is gone
-        // (linger is a single thread inside nvngx_dlssd detach -> bridge
-        // Unregister -> infinite WaitOnAddress). A cleared gCreating with a
-        // latched abandoned-prepared state means the hung NGX create returned
-        // late, so no thread is inside the runtime anymore: run the normal
-        // sidecar release to unregister bridge resources instead of leaking
-        // them into detach. Poison flags stay set, so this never re-arms
-        // attach.
-        if (!gCreating.load(std::memory_order_acquire) && gAbandonedPrepared.load(std::memory_order_acquire) &&
-            gRelease != nullptr)
-        {
-            LOG_INFO("DLSS-D experimental backend late-releasing abandoned sidecar after the hung owner returned");
-            if (auto logger = spdlog::default_logger())
-                logger->flush();
-            ReleasePreparedRuntimeLocked();
-            gAttachedRenderWidth = 0;
-            gAttachedRenderHeight = 0;
-            gAttachedOutputWidth = 0;
-            gAttachedOutputHeight = 0;
-            LOG_WARN("DLSS-D experimental backend released abandoned sidecar late; path stays poisoned");
-            return;
-        }
         gCallerShim = nullptr;
         gSidecarNvapi = nullptr;
         gAttached.store(false, std::memory_order_release);
@@ -685,5 +670,42 @@ void Release()
         gAttachedOutputHeight = 0;
     }
     gCreateFailed.store(false, std::memory_order_release);
+}
+
+bool ReleaseAbandonedLate()
+{
+    std::unique_lock lock(gLock);
+    if (!gAbandoned.load(std::memory_order_acquire) || gCreating.load(std::memory_order_acquire) ||
+        !gAbandonedPrepared.load(std::memory_order_acquire) || gRelease == nullptr)
+        return false;
+    // Caller guarantees no thread is inside the runtime (the hung owner has
+    // exited). Unregister bridge resources through the normal path so process
+    // detach does not trip over them. Poison flags stay set: no re-arm.
+    LOG_INFO("DLSS-D experimental backend late-releasing abandoned sidecar after the hung owner returned");
+    if (auto logger = spdlog::default_logger())
+        logger->flush();
+    ReleasePreparedRuntimeLocked();
+    gAttachedRenderWidth = 0;
+    gAttachedRenderHeight = 0;
+    gAttachedOutputWidth = 0;
+    gAttachedOutputHeight = 0;
+    LOG_WARN("DLSS-D experimental backend released abandoned sidecar late; path stays poisoned");
+    return true;
+}
+
+bool CreateProgress(uint32_t* allocHeartbeats, uint32_t* functionsCreated)
+{
+    if (gCreateProgress == nullptr)
+    {
+        if (allocHeartbeats != nullptr)
+            *allocHeartbeats = 0;
+        if (functionsCreated != nullptr)
+            *functionsCreated = 0;
+        return false;
+    }
+    const uint32_t alloc = gCreateProgress(functionsCreated);
+    if (allocHeartbeats != nullptr)
+        *allocHeartbeats = alloc;
+    return true;
 }
 } // namespace DlssdTranslatedSession

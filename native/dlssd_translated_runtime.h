@@ -80,6 +80,7 @@ using PFN_DlssdRuntime_Attach = uint32_t(__cdecl*)(void*, const wchar_t*, const 
 using PFN_DlssdRuntime_PrepareAttach = uint32_t(__cdecl*)(void*, const wchar_t*, const wchar_t*, const wchar_t*,
                                                           const wchar_t*, uint32_t, uint32_t, uint32_t, uint32_t);
 using PFN_DlssdRuntime_FinishAttach = uint32_t(__cdecl*)();
+using PFN_DlssdRuntime_CreateProgress = uint32_t(__cdecl*)(uint32_t*);
 using PFN_DlssdRuntime_Evaluate = uint32_t(__cdecl*)(const DlssdRuntimeFrame*);
 using PFN_DlssdRuntime_Release = uint32_t(__cdecl*)();
 using PFN_DlssdRuntime_LastError = const char*(__cdecl*)();

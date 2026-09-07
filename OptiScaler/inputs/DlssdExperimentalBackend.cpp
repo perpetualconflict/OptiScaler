@@ -83,7 +83,12 @@ bool gHaveLastDispatch = false;
 constexpr long long kDropMappingsIdleMs = 400;
 constexpr long long kLoadIdleMs = 1000;
 constexpr long long kLoadMinMs = 30000;
-constexpr long long kCreateTimeoutMs = 8000;
+// Measured 2026-09-07: cold isolated ZLUDA module compile for the 1706
+// contract is ~70 s with zero progress reuse between processes. The old 8 s
+// bound therefore killed every game create mid-compile. Abandon only at a
+// generous cap or when heartbeat progress stalls (see below).
+constexpr long long kCreateCapMs = 240000;
+constexpr long long kCreateStallMs = 45000;
 constexpr long long kVramStableMs = 10000;
 constexpr uint64_t kVramClimbBytes = 256ull * 1024ull * 1024ull;
 constexpr long long kSettleStableMs = 10000;
@@ -169,6 +174,12 @@ bool gLoggedBusyDefer = false;
 ID3D12Fence* gWaitFence = nullptr;
 HANDLE gWaitEvent = nullptr;
 UINT64 gWaitValue = 0;
+// Create-watchdog progress: last observed heartbeat counters and when they
+// last advanced. Abandon fires on cap expiry or on a stall (no advance).
+uint32_t gLastCreateAlloc = 0;
+uint32_t gLastCreateFuncs = 0;
+Clock::time_point gLastCreateProgressAt {};
+bool gHaveCreateProgressSample = false;
 
 void AddRefSnapshot(InputSnapshot& snapshot);
 void ReleaseSnapshot(InputSnapshot& snapshot);
@@ -197,7 +208,8 @@ void LogContractOnce()
                                  "owner thread. Input copies stay on the caller list; Present only "
                                  "signals a submitted frame. It is not same-command-list HIP insertion. "
                                  "Intro skips this path. A long NGX idle keeps FSR-RR for 30 s plus a "
-                                 "10 s resource settle and 60 s in-world. Create is bounded at 8 s. "
+                                 "10 s resource settle and 60 s in-world. Create runs up to 240 s while "
+                                 "heartbeat progresses and fails closed on a 45 s stall. "
                                  "Failures keep FSR-RR. Probe 2026-09-07: minimal gates active, "
                                  "settle/vram/inworld stability skipped, VRAM log-only at 2 Hz, hung "
                                  "owner detached without TerminateThread.");
@@ -829,15 +841,40 @@ bool QueueUnpublishedEvaluate(uint32_t handleId, const InputSnapshot& snapshot, 
 bool AbortHungCreateIfTimedOut(uint32_t handleId, const AcceptedExtent* extent)
 {
     if (!DlssdTranslatedSession::IsCreating())
+    {
+        gHaveCreateProgressSample = false;
         return false;
+    }
     const auto elapsedMs = DlssdTranslatedSession::CreatingElapsedMs();
-    if (elapsedMs < kCreateTimeoutMs)
+    uint32_t alloc = 0, funcs = 0;
+    const bool haveProgress = DlssdTranslatedSession::CreateProgress(&alloc, &funcs);
+    const auto now = Clock::now();
+    if (!gHaveCreateProgressSample || alloc != gLastCreateAlloc || funcs != gLastCreateFuncs)
+    {
+        if (gHaveCreateProgressSample)
+        {
+            LOG_INFO("DLSS-D experimental backend handle={} create progress alloc={} funcs={} elapsed_ms={} "
+                     "extent={} tid={}",
+                     handleId, alloc, funcs, elapsedMs, extent != nullptr ? extent->name : "none",
+                     GetCurrentThreadId());
+            FlushExperimentalLog();
+        }
+        gLastCreateAlloc = alloc;
+        gLastCreateFuncs = funcs;
+        gLastCreateProgressAt = now;
+        gHaveCreateProgressSample = true;
+    }
+    const long long stalledMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastCreateProgressAt).count();
+    const bool stalled = haveProgress && stalledMs >= kCreateStallMs;
+    if (elapsedMs < kCreateCapMs && !stalled)
         return false;
-    LOG_WARN("DLSS-D experimental backend handle={} create timed out after {} ms extent={}", handleId, elapsedMs,
-             extent != nullptr ? extent->name : "none");
-    LOG_WARN("DLSS-D experimental backend rendezvous stays paused while the detached owner is blocked; if no "
-             "ngx_create_call/return or create_heartbeat lines appear above, the deployed "
-             "dlssd_translated_runtime.dll predates the 2026-09-07 heartbeat probe");
+    LOG_WARN("DLSS-D experimental backend handle={} create {} after {} ms (stall_ms={} alloc={} funcs={} "
+             "progress_api={}) extent={}",
+             handleId, stalled ? "stalled" : "timed out", elapsedMs, stalledMs, alloc, funcs,
+             haveProgress ? 1 : 0, extent != nullptr ? extent->name : "none");
+    LOG_WARN("DLSS-D experimental backend rendezvous stays paused while the detached owner is blocked; expect "
+             "DLSS-D create heartbeat lines above while the sidecar runtime still compiles");
     FlushExperimentalLog();
     gRuntimePoisoned.store(true, std::memory_order_relaxed);
     gRejectedRuntime.fetch_add(1, std::memory_order_relaxed);
@@ -1253,8 +1290,17 @@ void Release(uint32_t handleId)
              DlssdTranslatedSession::IsCreating() ? 1 : 0, gOwnerAlive.load(std::memory_order_acquire) ? 1 : 0,
              gOwnerHungLeaked.load(std::memory_order_acquire) ? 1 : 0);
     FlushExperimentalLog();
+    const bool hungLeaked = gOwnerHungLeaked.load(std::memory_order_acquire);
+    const bool ownerGone = !gOwnerAlive.load(std::memory_order_acquire);
     StopOwner(DlssdTranslatedSession::IsCreating());
-    DlssdTranslatedSession::Release();
+    // Late-release only when the hung owner is verifiably gone. Releasing
+    // while it is still blocked inside CreateFeature deadlocks the quit path
+    // against it (dump 4: main in Shutdown1 SRW vs owner in module load).
+    bool releasedAbandonedLate = false;
+    if (hungLeaked && ownerGone)
+        releasedAbandonedLate = DlssdTranslatedSession::ReleaseAbandonedLate();
+    if (!releasedAbandonedLate)
+        DlssdTranslatedSession::Release();
     gHaveLastKey = false;
     gHaveLastDispatch = false;
     gSettling = false;

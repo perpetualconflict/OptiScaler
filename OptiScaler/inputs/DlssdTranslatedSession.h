@@ -23,6 +23,15 @@ bool IsAttached();
 bool IsPrepared();
 bool IsCreating();
 long long CreatingElapsedMs();
+// Late-abandon cleanup, called only when no thread is inside the runtime
+// (the hung owner has exited). Runs the normal sidecar release for a
+// previously abandoned prepare so bridge registrations do not leak into
+// process detach. Poison stays, so this never re-arms attach.
+bool ReleaseAbandonedLate();
+// Host create-watchdog progress: allocation heartbeats plus translated
+// functions created. Returns false when the loaded sidecar predates the
+// progress export; counters are zero then.
+bool CreateProgress(uint32_t* allocHeartbeats, uint32_t* functionsCreated);
 bool AttachLoadBypassActive();
 HMODULE LoadSidecarNvapiForAttach();
 HMODULE NvapiHandleForAttach();
