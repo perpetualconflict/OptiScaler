@@ -176,10 +176,16 @@ HANDLE gWaitEvent = nullptr;
 UINT64 gWaitValue = 0;
 // Create-watchdog progress: last observed heartbeat counters and when they
 // last advanced. Abandon fires on cap expiry or on a stall (no advance).
+// Sidecar queries are throttled: the owner may be blocked inside proprietary
+// CreateFeature while the game thread evaluates, so per-evaluate cross-module
+// stats calls are avoided and the quit path only reads this cache.
 uint32_t gLastCreateAlloc = 0;
 uint32_t gLastCreateFuncs = 0;
+bool gLastCreateHaveProgress = false;
 Clock::time_point gLastCreateProgressAt {};
+Clock::time_point gLastCreateQueryAt {};
 bool gHaveCreateProgressSample = false;
+constexpr long long kCreateProgressQueryMs = 500;
 
 void AddRefSnapshot(InputSnapshot& snapshot);
 void ReleaseSnapshot(InputSnapshot& snapshot);
@@ -778,10 +784,16 @@ void StopOwner(bool abortIfCreating)
             gOwnerBusy.store(false, std::memory_order_release);
             gShutdown = true;
         }
+        const auto abandonElapsedMs = DlssdTranslatedSession::CreatingElapsedMs();
         DlssdTranslatedSession::AbandonHungCreate();
         ReleaseWaitFence();
         LOG_WARN("DLSS-D experimental backend detached the hung NGX owner thread without terminating it; "
                  "path is poisoned and no second owner will start");
+        LOG_WARN("DLSS-D experimental backend abandoned create after {} ms (alloc={} funcs={} progress_api={}); "
+                 "the hung proprietary create may still be inside driver code at quit, so a lingering game process "
+                 "after clean exit must be ended via Task Manager",
+                 abandonElapsedMs, gLastCreateAlloc, gLastCreateFuncs,
+                 gLastCreateHaveProgress ? 1 : 0);
         FlushExperimentalLog();
         return;
     }
@@ -846,24 +858,38 @@ bool AbortHungCreateIfTimedOut(uint32_t handleId, const AcceptedExtent* extent)
         return false;
     }
     const auto elapsedMs = DlssdTranslatedSession::CreatingElapsedMs();
-    uint32_t alloc = 0, funcs = 0;
-    const bool haveProgress = DlssdTranslatedSession::CreateProgress(&alloc, &funcs);
     const auto now = Clock::now();
-    if (!gHaveCreateProgressSample || alloc != gLastCreateAlloc || funcs != gLastCreateFuncs)
+    // Throttle sidecar progress queries: with the instrumented runtime each
+    // query crosses into the bridge stats path while the owner is blocked
+    // inside proprietary CreateFeature. Stall math runs on the cache.
+    const bool queryDue =
+        !gHaveCreateProgressSample ||
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastCreateQueryAt).count() >=
+            kCreateProgressQueryMs;
+    if (queryDue)
     {
-        if (gHaveCreateProgressSample)
+        uint32_t alloc = 0, funcs = 0;
+        gLastCreateHaveProgress = DlssdTranslatedSession::CreateProgress(&alloc, &funcs);
+        gLastCreateQueryAt = now;
+        if (!gHaveCreateProgressSample || alloc != gLastCreateAlloc || funcs != gLastCreateFuncs)
         {
-            LOG_INFO("DLSS-D experimental backend handle={} create progress alloc={} funcs={} elapsed_ms={} "
-                     "extent={} tid={}",
-                     handleId, alloc, funcs, elapsedMs, extent != nullptr ? extent->name : "none",
-                     GetCurrentThreadId());
-            FlushExperimentalLog();
+            if (gHaveCreateProgressSample)
+            {
+                LOG_INFO("DLSS-D experimental backend handle={} create progress alloc={} funcs={} elapsed_ms={} "
+                         "extent={} tid={}",
+                         handleId, alloc, funcs, elapsedMs, extent != nullptr ? extent->name : "none",
+                         GetCurrentThreadId());
+                FlushExperimentalLog();
+            }
+            gLastCreateAlloc = alloc;
+            gLastCreateFuncs = funcs;
+            gLastCreateProgressAt = now;
+            gHaveCreateProgressSample = true;
         }
-        gLastCreateAlloc = alloc;
-        gLastCreateFuncs = funcs;
-        gLastCreateProgressAt = now;
-        gHaveCreateProgressSample = true;
     }
+    const uint32_t alloc = gLastCreateAlloc;
+    const uint32_t funcs = gLastCreateFuncs;
+    const bool haveProgress = gLastCreateHaveProgress;
     const long long stalledMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastCreateProgressAt).count();
     const bool stalled = haveProgress && stalledMs >= kCreateStallMs;
@@ -1286,9 +1312,11 @@ void Release(uint32_t handleId)
 {
     if (!Enabled())
         return;
-    LOG_INFO("DLSS-D experimental backend release enter creating={} owner_alive={} hung_leaked={}",
+    LOG_INFO("DLSS-D experimental backend release enter creating={} owner_alive={} hung_leaked={} "
+             "create_ms={} alloc={} funcs={} progress_api={}",
              DlssdTranslatedSession::IsCreating() ? 1 : 0, gOwnerAlive.load(std::memory_order_acquire) ? 1 : 0,
-             gOwnerHungLeaked.load(std::memory_order_acquire) ? 1 : 0);
+             gOwnerHungLeaked.load(std::memory_order_acquire) ? 1 : 0, DlssdTranslatedSession::CreatingElapsedMs(),
+             gLastCreateAlloc, gLastCreateFuncs, gLastCreateHaveProgress ? 1 : 0);
     FlushExperimentalLog();
     const bool hungLeaked = gOwnerHungLeaked.load(std::memory_order_acquire);
     const bool ownerGone = !gOwnerAlive.load(std::memory_order_acquire);
