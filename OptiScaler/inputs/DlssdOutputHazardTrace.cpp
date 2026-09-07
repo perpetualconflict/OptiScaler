@@ -362,6 +362,11 @@ void RecordResolvedUseLocked(HandleState& handle, uint32_t handleId, ID3D12Graph
 
     if (kind == ConsumerKind::SameSubmissionOtherList)
     {
+        // Bound the deferred list: an unsubmitted list may never arrive, and
+        // its address can be recycled by the game in the meantime.
+        constexpr size_t kMaxPendingOtherListUses = 64;
+        while (handle.pendingOtherListUses.size() >= kMaxPendingOtherListUses)
+            handle.pendingOtherListUses.erase(handle.pendingOtherListUses.begin());
         handle.pendingOtherListUses.emplace_back(commandList, eventName);
         if (handle.laterLogs < kMaxDetailLogs)
         {
@@ -510,6 +515,9 @@ void BeginEvaluateLocked(uint32_t handleId, NVSDK_NGX_Feature featureId, ID3D12G
     handle.output = output;
     handle.outputGpuVa = 0;
     handle.pendingOtherListUses.clear();
+    // The game recycles command-list addresses. A bind tracked under this
+    // address from a destroyed list must not leak into the new recording.
+    PendingBinds.erase(commandList);
     if (output != nullptr)
         handle.outputGpuVa = output->GetGPUVirtualAddress();
 
@@ -573,6 +581,10 @@ void ObserveExecuteLocked(ID3D12CommandQueue* queue, UINT numLists, ID3D12Comman
                 handle.firstMatchingSubmit = seq;
             }
             handle.phase = Phase::EvalListSubmitted;
+            const uintptr_t submittedEvalList = reinterpret_cast<uintptr_t>(handle.evalList);
+            // The game recycles command-list addresses after submit. Clear the
+            // raw pointer now that the submission is recorded so a later list
+            // reused at the same address cannot false-match this handle.
 
             if (handle.matchLogs < kMaxDetailLogs)
             {
@@ -587,8 +599,9 @@ void ObserveExecuteLocked(ID3D12CommandQueue* queue, UINT numLists, ID3D12Comman
                 LOG_INFO("DLSS-D output-order submit seq={} queue=0x{:X} type={} lists={} match_index={} "
                          "handle={} eval={} evalList=0x{:X} [{}]",
                          seq, reinterpret_cast<uintptr_t>(queue), QueueTypeName(queueType), numLists, matchIndex, handleId,
-                         handle.lastEvalSeq, reinterpret_cast<uintptr_t>(handle.evalList), listsText.str());
+                         handle.lastEvalSeq, submittedEvalList, listsText.str());
             }
+            handle.evalList = nullptr;
         }
 
         auto pending = handle.pendingOtherListUses.begin();
@@ -1269,6 +1282,31 @@ void OnRelease(uint32_t handleId)
         return;
     LogSummaryLocked(handleId, it->second, "release");
     Handles.erase(it);
+}
+
+void InvalidateHandle(uint32_t handleId)
+{
+    std::lock_guard lock(StateMutex);
+    const auto it = Handles.find(handleId);
+    if (it == Handles.end())
+        return;
+    // Erase any binds/pending uses keyed by this handle's raw list pointer
+    // before dropping the entry.
+    for (auto bind = PendingBinds.begin(); bind != PendingBinds.end();)
+    {
+        if (bind->first == it->second.evalList)
+            bind = PendingBinds.erase(bind);
+        else
+            ++bind;
+    }
+    Handles.erase(it);
+}
+
+void InvalidateAll()
+{
+    std::lock_guard lock(StateMutex);
+    Handles.clear();
+    PendingBinds.clear();
 }
 
 void Shutdown()

@@ -18,6 +18,11 @@ bool Enabled();
 void InstallForDevice(ID3D12Device* device);
 void OnCreate(uint32_t handleId, NVSDK_NGX_Feature featureId, ID3D12GraphicsCommandList* commandList);
 void OnRelease(uint32_t handleId);
+// Drop tracked per-handle state without logging a summary. The game may free
+// and recycle command lists and resources at any time; holding raw pointers
+// past submit risks false matches against recycled addresses (2026-09-07 AV).
+void InvalidateHandle(uint32_t handleId);
+void InvalidateAll();
 void Shutdown();
 
 class ScopedEvaluate

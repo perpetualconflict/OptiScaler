@@ -2,6 +2,7 @@
 
 #include "DlssdExperimentalBackend.h"
 #include "DlssdTranslatedSession.h"
+#include "DlssdOutputHazardTrace.h"
 
 #include <Config.h>
 #include <State.h>
@@ -64,6 +65,14 @@ Clock::time_point gInWorldAt {};
 bool gInWorld = false;
 Clock::time_point gLastDispatchAt {};
 bool gHaveLastDispatch = false;
+// Post-attach quiesce (2026-09-07): NGX CreateFeature returned after 81.6 s,
+// but the owner kept servicing seq=39 allocations + copy-ins concurrently
+// with game evaluates and the process AV'd on a recycled 0x26BF... list
+// address. After attach, stay unpublished with no caller-list copies and no
+// owner evaluates until this window elapses. FSR-RR stays presented.
+Clock::time_point gAttachReadyAt {};
+bool gHaveAttachReady = false;
+constexpr long long kPostAttachQuiesceMs = 120000;
 
 // The 7 s NGX gap at save-load is the load START, not "world ready".
 // Same-thread Init+Create on the Streamline evaluate caller never
@@ -195,6 +204,8 @@ void EnsureOwner();
 void StopOwner(bool abortIfCreating);
 bool QueueFinishAttach(uint32_t handleId);
 bool AbortHungCreateIfTimedOut(uint32_t handleId, const AcceptedExtent* extent);
+long long MsUntil(const Clock::time_point& start, long long durationMs);
+long long PostAttachQuiesceRemainingMs();
 
 void FlushExperimentalLog()
 {
@@ -214,9 +225,11 @@ void LogContractOnce()
                                  "owner thread. Input copies stay on the caller list; Present only "
                                  "signals a submitted frame. It is not same-command-list HIP insertion. "
                                  "Intro skips this path. A long NGX idle keeps FSR-RR for 30 s plus a "
-                                 "10 s resource settle and 60 s in-world. Create runs up to 240 s while "
-                                 "heartbeat progresses and fails closed on a 45 s stall. "
-                                 "Failures keep FSR-RR. Probe 2026-09-07: minimal gates active, "
+                                  "10 s resource settle and 60 s in-world. Create runs up to 240 s while "
+                                  "heartbeat progresses and fails closed on a 45 s stall. "
+                                  "After attach, a 120 s post-attach quiesce keeps FSR-RR with no "
+                                  "caller-list copies and no owner evaluates while the sidecar settles. "
+                                  "Failures keep FSR-RR. Probe 2026-09-07: minimal gates active, "
                                  "settle/vram/inworld stability skipped, VRAM log-only at 2 Hz, hung "
                                  "owner detached without TerminateThread.");
                    });
@@ -282,8 +295,10 @@ void DropTranslatedMappings()
     }
     gHaveLastKey = false;
     gHaveLastDispatch = false;
+    gHaveAttachReady = false;
     gSettling = false;
     gInWorld = false;
+    DlssdOutputHazardTrace::InvalidateAll();
     if (DlssdTranslatedSession::IsCreating())
     {
         LOG_INFO("DLSS-D experimental backend skipped translated release while NGX create is in flight");
@@ -293,6 +308,15 @@ void DropTranslatedMappings()
         DlssdTranslatedSession::Release();
     else
         LOG_INFO("DLSS-D experimental backend deferred translated release until the owner finishes");
+}
+
+// Post-attach quiesce: milliseconds remaining before owner evaluates and
+// caller-list copies are allowed again. Zero when attach is not ready.
+long long PostAttachQuiesceRemainingMs()
+{
+    if (!gHaveAttachReady || !DlssdTranslatedSession::IsAttached())
+        return 0;
+    return MsUntil(gAttachReadyAt, kPostAttachQuiesceMs);
 }
 
 bool AttachInFlight()
@@ -678,8 +702,11 @@ void OwnerLoop()
             }
             else
             {
-                LOG_INFO("DLSS-D experimental backend handle={} finish attach ok ms={} tid={}", job.handleId,
-                         elapsedMs, GetCurrentThreadId());
+                gAttachReadyAt = Clock::now();
+                gHaveAttachReady = true;
+                LOG_INFO("DLSS-D experimental backend handle={} finish attach ok ms={} tid={} "
+                         "post_attach_quiesce_ms={}",
+                         job.handleId, elapsedMs, GetCurrentThreadId(), kPostAttachQuiesceMs);
                 FlushExperimentalLog();
             }
         }
@@ -826,6 +853,10 @@ bool QueueFinishAttach(uint32_t handleId)
     gJob.op = OwnerOp::FinishAttach;
     gJob.handleId = handleId;
     gHaveJob = true;
+    // Baseline the create-watchdog stall clock at queue time so a slow but
+    // progressing proprietary compile is never measured from the epoch.
+    gLastCreateProgressAt = Clock::now();
+    gHaveCreateProgressSample = false;
     gJobCv.notify_one();
     return true;
 }
@@ -890,8 +921,12 @@ bool AbortHungCreateIfTimedOut(uint32_t handleId, const AcceptedExtent* extent)
     const uint32_t alloc = gLastCreateAlloc;
     const uint32_t funcs = gLastCreateFuncs;
     const bool haveProgress = gLastCreateHaveProgress;
+    // Without a first heartbeat sample there is no stall signal yet; report
+    // zero instead of measuring from the epoch.
     const long long stalledMs =
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastCreateProgressAt).count();
+        haveProgress
+            ? std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastCreateProgressAt).count()
+            : 0;
     const bool stalled = haveProgress && stalledMs >= kCreateStallMs;
     if (elapsedMs < kCreateCapMs && !stalled)
         return false;
@@ -1006,6 +1041,13 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
 
     if (commandList == nullptr)
         return SkipUnsafe(handleId, "missing_cmdlist", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
+
+    // Post-attach quiesce: no caller-list copies and no owner evaluates until
+    // the window elapses. The sidecar otherwise keeps allocating (seq=39) and
+    // copying in concurrently with game evaluates.
+    if (const long long quiesceMs = PostAttachQuiesceRemainingMs(); quiesceMs > 0)
+        return SkipUnsafe(handleId, "post_attach_quiesce", IdleSinceLastBoundaryMs(), snapshot.reset, extent,
+                          quiesceMs);
 
     const char* copyError = nullptr;
     if (!DlssdTranslatedSession::Evaluate(commandList, snapshot, nullptr, false, &copyError,
@@ -1268,6 +1310,19 @@ void NotifyFrameSubmitted()
         return;
     if (!DlssdTranslatedSession::IsAttached() || DlssdTranslatedSession::IsCreating())
         return;
+    // Post-attach quiesce: drop any pre-attach pending work (releasing its
+    // queue/resource refs) instead of dispatching owner evaluates while the
+    // sidecar still settles.
+    if (PostAttachQuiesceRemainingMs() > 0)
+    {
+        std::lock_guard lock(gJobMutex);
+        if (gHavePending)
+        {
+            ReleaseJob(gPending);
+            gHavePending = false;
+        }
+        return;
+    }
     OwnerJob pending;
     {
         std::lock_guard lock(gJobMutex);
@@ -1331,8 +1386,10 @@ void Release(uint32_t handleId)
         DlssdTranslatedSession::Release();
     gHaveLastKey = false;
     gHaveLastDispatch = false;
+    gHaveAttachReady = false;
     gSettling = false;
     gInWorld = false;
+    DlssdOutputHazardTrace::InvalidateAll();
     gVramHistory.clear();
     gVramLastBytes = 0;
     gVramQueryOk = false;

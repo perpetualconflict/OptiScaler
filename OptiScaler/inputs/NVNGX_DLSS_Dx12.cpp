@@ -7,6 +7,7 @@
 #include "NgxFeatureTrace.h"
 #include "DlssdOutputHazardTrace.h"
 #include "DlssdQueueRendezvous.h"
+#include "DlssdTranslatedSession.h"
 #include "proxies/FfxApi_Proxy.h"
 #include "proxies/NVNGX_Proxy.h"
 
@@ -1010,7 +1011,11 @@ static NVSDK_NGX_Result TryEvaluateOptiFeature(ID3D12GraphicsCommandList* InCmdL
 
     // Root signature restoration setup
     bool queueRendezvous = HandleToFeature[handleId] == NVSDK_NGX_Feature_RayReconstruction &&
-                           DlssdQueueRendezvous::Enabled();
+                           DlssdQueueRendezvous::Enabled() && !DlssdTranslatedSession::IsCreating() &&
+                           !DlssdTranslatedSession::IsAttached();
+    // The synthetic probe injects compute work onto the game command list.
+    // Never mutate game lists while the sidecar owns HIP (create) or after
+    // attach (2026-09-07 AV on a recycled list address post-attach).
     // The diagnostic appends its own compute root signature at the feature tail.
     // Force restoration while it is active even when the general hotfix is off.
     const bool configuredRestore = cfg.RestoreComputeSignature.value_or_default() ||
