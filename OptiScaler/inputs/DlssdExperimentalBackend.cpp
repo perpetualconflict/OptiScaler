@@ -826,6 +826,9 @@ bool AbortHungCreateIfTimedOut(uint32_t handleId, const AcceptedExtent* extent)
         return false;
     LOG_WARN("DLSS-D experimental backend handle={} create timed out after {} ms extent={}", handleId, elapsedMs,
              extent != nullptr ? extent->name : "none");
+    LOG_WARN("DLSS-D experimental backend rendezvous stays paused while the detached owner is blocked; if no "
+             "ngx_create_call/return or create_heartbeat lines appear above, the deployed "
+             "dlssd_translated_runtime.dll predates the 2026-09-07 heartbeat probe");
     FlushExperimentalLog();
     gRuntimePoisoned.store(true, std::memory_order_relaxed);
     gRejectedRuntime.fetch_add(1, std::memory_order_relaxed);
