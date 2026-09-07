@@ -90,6 +90,13 @@ constexpr long long kSettleStableMs = 10000;
 constexpr long long kInWorldStableMs = 60000;
 constexpr long long kExperimentalMinIntervalMs = 2000;
 constexpr uint32_t kSkipLogEvery = 60;
+// Create-hang probe (2026-09-07): skip the unvalidated settle/vram/inworld
+// stability heuristics for one run to isolate the hang from gating.
+// Load-window + intro/resource/reset/idle safety stays. Reversible by setting
+// this back to false. When true, VRAM is still sampled (throttled, log only)
+// but never gates attach.
+constexpr bool kProbeMinimalGates = true;
+constexpr long long kVramQueryMinIntervalMs = 500;
 
 struct EvaluateKey
 {
@@ -120,6 +127,8 @@ long long gVramSpanMs = 0;
 bool gVramQueryOk = false;
 bool gVramSawClimb = false;
 bool gLoggedDeadVramQuery = false;
+Clock::time_point gLastVramQueryAt {};
+bool gHaveVramQueryAt = false;
 const char* gLastSkipReason = "";
 uint32_t gLastSkipReasonCount = 0;
 
@@ -144,6 +153,12 @@ std::mutex gThreadMutex;
 std::thread gOwner;
 bool gHaveJob = false;
 std::atomic<bool> gOwnerBusy { false };
+// Create-hang probe (2026-09-07): the owner may be blocked inside proprietary
+// NGX CreateFeature. Terminating that thread corrupts driver/C++ locks held
+// at the kill point and orphans the CaptureNgxDescriptorsGuard. Instead we
+// detach-and-leak the hung owner once, poison the path, and never start a
+// second owner that would compete for ZLUDA TLS and device hooks.
+std::atomic<bool> gOwnerHungLeaked { false };
 bool gShutdown = false;
 OwnerJob gJob;
 OwnerJob gPending;
@@ -174,15 +189,17 @@ void LogContractOnce()
     std::call_once(gLoggedContract,
                    []
                    {
-                       LOG_INFO("DLSS-D experimental backend: accepted contracts are 1706x960 -> 2560x1440 "
-                                "(Cyberpunk Quality) and isolated 1920x1080 -> 3840x2160 signed 310.7. "
-                                "Prepare stays on the NGX evaluate call without loading nvcuda. "
-                                "Init, CreateFeature, and sidecar EvaluateFeature run on a persistent "
-                                "owner thread. Input copies stay on the caller list; Present only "
-                                "signals a submitted frame. It is not same-command-list HIP insertion. "
-                                "Intro skips this path. A long NGX idle keeps FSR-RR for 30 s plus a "
-                                "10 s resource settle and 60 s in-world. Create is bounded at 8 s. "
-                                "Failures keep FSR-RR.");
+                        LOG_INFO("DLSS-D experimental backend: accepted contracts are 1706x960 -> 2560x1440 "
+                                 "(Cyberpunk Quality) and isolated 1920x1080 -> 3840x2160 signed 310.7. "
+                                 "Prepare stays on the NGX evaluate call without loading nvcuda. "
+                                 "Init, CreateFeature, and sidecar EvaluateFeature run on a persistent "
+                                 "owner thread. Input copies stay on the caller list; Present only "
+                                 "signals a submitted frame. It is not same-command-list HIP insertion. "
+                                 "Intro skips this path. A long NGX idle keeps FSR-RR for 30 s plus a "
+                                 "10 s resource settle and 60 s in-world. Create is bounded at 8 s. "
+                                 "Failures keep FSR-RR. Probe 2026-09-07: minimal gates active, "
+                                 "settle/vram/inworld stability skipped, VRAM log-only at 2 Hz, hung "
+                                 "owner detached without TerminateThread.");
                    });
 }
 
@@ -591,8 +608,15 @@ bool WaitGameQueue(ID3D12CommandQueue* queue, DWORD timeoutMs)
 
 void OwnerLoop()
 {
-    DlssdTranslatedSession::ScopedAttachLoadBypass bypass;
-    DlssdTranslatedSession::BindCudaOnThisThread();
+    // Narrow bypass: only the CUDA bind and the blocking NGX create/evaluate
+    // calls need attach-load handling. Holding bypass for the whole thread
+    // lifetime masks game-thread loads and was only hiding bugs.
+    // FinishAttachOnOwnerThread already scopes its own bypass around the
+    // proprietary CreateFeature call below.
+    {
+        DlssdTranslatedSession::ScopedAttachLoadBypass bindBypass;
+        DlssdTranslatedSession::BindCudaOnThisThread();
+    }
     LOG_INFO("DLSS-D experimental backend NGX owner tid={}", GetCurrentThreadId());
     FlushExperimentalLog();
     for (;;)
@@ -692,6 +716,8 @@ void EnsureOwner()
     std::lock_guard lock(gThreadMutex);
     if (gOwner.joinable())
         return;
+    if (gOwnerHungLeaked.load(std::memory_order_acquire))
+        return;
     gShutdown = false;
     gOwner = std::thread(OwnerLoop);
 }
@@ -704,8 +730,12 @@ void StopOwner(bool abortIfCreating)
         std::lock_guard threadLock(gThreadMutex);
         if (gOwner.joinable())
         {
-            TerminateThread(gOwner.native_handle(), 1);
+            // Do not TerminateThread inside NVNGX/ZLUDA/HIP driver code.
+            // Detach-and-leak keeps the hung thread's locks owned instead of
+            // orphaning them mid-call. The path is poisoned so no second
+            // owner or new create is attempted afterwards.
             gOwner.detach();
+            gOwnerHungLeaked.store(true, std::memory_order_release);
         }
         std::unique_lock lock(gJobMutex, std::try_to_lock);
         if (lock.owns_lock())
@@ -729,7 +759,8 @@ void StopOwner(bool abortIfCreating)
         }
         DlssdTranslatedSession::AbandonHungCreate();
         ReleaseWaitFence();
-        LOG_WARN("DLSS-D experimental backend aborted the hung NGX owner thread");
+        LOG_WARN("DLSS-D experimental backend detached the hung NGX owner thread without terminating it; "
+                 "path is poisoned and no second owner will start");
         FlushExperimentalLog();
         return;
     }
@@ -1000,7 +1031,20 @@ Decision Evaluate(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Graphi
         commandList->GetDevice(IID_PPV_ARGS(&device));
     if (device != nullptr)
     {
-        NoteVram(QueryLocalVramBytes(device));
+        // Throttle VRAM queries off the render thread: factory creation plus
+        // adapter enumeration every evaluate hitches. 2 Hz sampling is enough
+        // for the log-only probe signal.
+        const auto now = Clock::now();
+        const bool dueForQuery =
+            !gHaveVramQueryAt ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - gLastVramQueryAt).count() >=
+                kVramQueryMinIntervalMs;
+        if (dueForQuery)
+        {
+            NoteVram(QueryLocalVramBytes(device));
+            gLastVramQueryAt = now;
+            gHaveVramQueryAt = true;
+        }
         device->Release();
         device = nullptr;
     }
@@ -1075,13 +1119,15 @@ Decision Evaluate(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Graphi
         gHaveLastKey = true;
     }
 
-    if (gSettling)
+    if (gSettling && !kProbeMinimalGates)
     {
         const long long settleRemainingMs = MsUntil(gSettleStarted, kSettleStableMs);
         if (settleRemainingMs > 0)
             return SkipUnsafe(handleId, "settle", idleMs, snapshot.reset, extent, settleRemainingMs);
         gSettling = false;
     }
+    if (kProbeMinimalGates)
+        gSettling = false;
 
     if (!gInWorld)
     {
@@ -1089,14 +1135,16 @@ Decision Evaluate(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Graphi
         gInWorldAt = Clock::now();
     }
 
+    // Probe: VRAM is log-only. A climbing window must not block attach until
+    // a probe correlates it with create success.
     const bool vramWindowClimbing =
-        gVramQueryOk && gVramWindowMax > gVramWindowMin &&
+        !kProbeMinimalGates && gVramQueryOk && gVramWindowMax > gVramWindowMin &&
         (gVramWindowMax - gVramWindowMin) >= kVramClimbBytes;
     if (vramWindowClimbing)
         return SkipUnsafe(handleId, "vram", idleMs, snapshot.reset, extent, kVramStableMs);
 
     const long long inWorldRemainingMs = MsUntil(gInWorldAt, kInWorldStableMs);
-    if (inWorldRemainingMs > 0)
+    if (!kProbeMinimalGates && inWorldRemainingMs > 0)
         return SkipUnsafe(handleId, "inworld", idleMs, snapshot.reset, extent, inWorldRemainingMs);
 
     if (DlssdTranslatedSession::IsCreating())

@@ -53,6 +53,10 @@ uint32_t gAttachedRenderWidth = 0;
 uint32_t gAttachedRenderHeight = 0;
 uint32_t gAttachedOutputWidth = 0;
 uint32_t gAttachedOutputHeight = 0;
+// Device hooks patch the vtable process-wide. Refuse a cross-device attach
+// instead of silently reusing hooks captured from a different adapter.
+LUID gPreparedLuid {};
+bool gHavePreparedLuid = false;
 std::wstring gDataPath;
 std::wstring gCudaPath;
 std::atomic<bool> gAbandoned { false };
@@ -306,6 +310,15 @@ bool EnsurePrepared(ID3D12Device* device, uint32_t renderWidth, uint32_t renderH
             *error = "translated runtime requires the evaluate device";
         return false;
     }
+    const LUID deviceLuid = device->GetAdapterLuid();
+    if ((gPrepared.load(std::memory_order_acquire) || gAttached.load(std::memory_order_acquire)) &&
+        gHavePreparedLuid &&
+        (gPreparedLuid.LowPart != deviceLuid.LowPart || gPreparedLuid.HighPart != deviceLuid.HighPart))
+    {
+        if (error)
+            *error = "translated runtime is bound to a different adapter";
+        return false;
+    }
     if (!LoadRuntime(error))
         return false;
 
@@ -381,6 +394,8 @@ bool EnsurePrepared(ID3D12Device* device, uint32_t renderWidth, uint32_t renderH
     }
     gPrepared = true;
     gCudaPath = cuda.wstring();
+    gPreparedLuid = deviceLuid;
+    gHavePreparedLuid = true;
     gAttachedRenderWidth = renderWidth;
     gAttachedRenderHeight = renderHeight;
     gAttachedOutputWidth = outputWidth;
@@ -424,6 +439,8 @@ void ReleasePreparedRuntimeLocked()
     ReleaseSidecarNvapi();
     gAttached.store(false, std::memory_order_release);
     gPrepared.store(false, std::memory_order_release);
+    gHavePreparedLuid = false;
+    gPreparedLuid = {};
     gAttachedRenderWidth = 0;
     gAttachedRenderHeight = 0;
     gAttachedOutputWidth = 0;
@@ -601,6 +618,8 @@ void Release()
         gAttached.store(false, std::memory_order_release);
         gPrepared.store(false, std::memory_order_release);
         gCreating.store(false, std::memory_order_release);
+        gHavePreparedLuid = false;
+        gPreparedLuid = {};
         gAttachedRenderWidth = 0;
         gAttachedRenderHeight = 0;
         gAttachedOutputWidth = 0;
@@ -626,6 +645,8 @@ void Release()
         ReleaseSidecarNvapi();
         gAttached.store(false, std::memory_order_release);
         gPrepared.store(false, std::memory_order_release);
+        gHavePreparedLuid = false;
+        gPreparedLuid = {};
         gAttachedRenderWidth = 0;
         gAttachedRenderHeight = 0;
         gAttachedOutputWidth = 0;
