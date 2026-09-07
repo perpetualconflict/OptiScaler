@@ -60,6 +60,12 @@ bool gHavePreparedLuid = false;
 std::wstring gDataPath;
 std::wstring gCudaPath;
 std::atomic<bool> gAbandoned { false };
+// AbandonHungCreate clears gPrepared so nothing treats the session as live,
+// but the sidecar modules stay mapped for a still-blocked owner. This latch
+// remembers that a releasable prepared state existed, so Release can run the
+// normal sidecar release once the hung create has returned. Poison flags are
+// separate and never cleared here, so this never re-arms attach.
+std::atomic<bool> gAbandonedPrepared { false };
 
 std::filesystem::path ModuleDirectory()
 {
@@ -416,6 +422,9 @@ void BindCudaOnThisThread()
 
 void AbandonHungCreate()
 {
+    gAbandonedPrepared.store(gPrepared.load(std::memory_order_acquire) ||
+                                 gAttached.load(std::memory_order_acquire),
+                             std::memory_order_release);
     gCreating.store(false, std::memory_order_release);
     gCreateFailed.store(true, std::memory_order_release);
     gPrepared.store(false, std::memory_order_release);
@@ -439,6 +448,7 @@ void ReleasePreparedRuntimeLocked()
     ReleaseSidecarNvapi();
     gAttached.store(false, std::memory_order_release);
     gPrepared.store(false, std::memory_order_release);
+    gAbandonedPrepared.store(false, std::memory_order_release);
     gHavePreparedLuid = false;
     gPreparedLuid = {};
     gAttachedRenderWidth = 0;
@@ -615,13 +625,13 @@ void Release()
     {
         // Dump verdict 2026-09-07: by process exit the hung owner is gone
         // (linger is a single thread inside nvngx_dlssd detach -> bridge
-        // Unregister -> infinite WaitOnAddress). A cleared gCreating with
-        // prepared/attached state means the hung NGX create returned late,
-        // so no thread is inside the runtime anymore: run the normal sidecar
-        // release to unregister bridge resources instead of leaking them
-        // into detach. Poison flags stay set, so this never re-arms attach.
-        if (!gCreating.load(std::memory_order_acquire) &&
-            (gPrepared.load(std::memory_order_acquire) || gAttached.load(std::memory_order_acquire)) &&
+        // Unregister -> infinite WaitOnAddress). A cleared gCreating with a
+        // latched abandoned-prepared state means the hung NGX create returned
+        // late, so no thread is inside the runtime anymore: run the normal
+        // sidecar release to unregister bridge resources instead of leaking
+        // them into detach. Poison flags stay set, so this never re-arms
+        // attach.
+        if (!gCreating.load(std::memory_order_acquire) && gAbandonedPrepared.load(std::memory_order_acquire) &&
             gRelease != nullptr)
         {
             LOG_INFO("DLSS-D experimental backend late-releasing abandoned sidecar after the hung owner returned");
