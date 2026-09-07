@@ -526,6 +526,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClInclude Include="inputs\NgxFeatureTrace.h" />
     <ClInclude Include="inputs\DlssdOutputHazardTrace.h" />
     <ClInclude Include="inputs\DlssdQueueRendezvous.h" />
+    <ClInclude Include="inputs\DlssdExperimentalBackend.h" />
+    <ClInclude Include="inputs\DlssdTranslatedSession.h" />
     <ClInclude Include="inputs\FSR2_Dx12.h" />
     <ClInclude Include="inputs\FSR3_Dx12.h" />
     <ClInclude Include="include\imgui\imconfig.h" />
@@ -837,6 +839,8 @@ copy NUL "$(SolutionDir)x64\Release\a\!! EXTRACT ALL FILES TO GAME FOLDER !!" /Y
     <ClCompile Include="inputs\NgxFeatureTrace.cpp" />
     <ClCompile Include="inputs\DlssdOutputHazardTrace.cpp" />
     <ClCompile Include="inputs\DlssdQueueRendezvous.cpp" />
+    <ClCompile Include="inputs\DlssdExperimentalBackend.cpp" />
+    <ClCompile Include="inputs\DlssdTranslatedSession.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Dx12.cpp" />
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="inputs\NVNGX_DLSS_Vk.cpp" />

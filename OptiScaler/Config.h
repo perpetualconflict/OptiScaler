@@ -280,6 +280,7 @@ class Config
     CustomOptional<bool> FSRRLogInputs { true };
     CustomOptional<bool> FSRRTraceDlssdOutputOrdering { false };
     CustomOptional<bool> FSRRTestDlssdQueueRendezvous { false };
+    CustomOptional<bool> FSRRExperimentalDlssd { false };
     CustomOptional<int> FSRRDebugOutput { 0 };
 
     // Nukems

@@ -343,9 +343,13 @@ InputSnapshot CaptureInputs(uint32_t handleId, uint32_t frameIndex, const NVSDK_
         snapshot.preExposure = floatValue;
     if (TryGetFloat(parameters, "DLSS.Exposure.Scale", floatValue))
         snapshot.exposureScale = floatValue;
+    if (TryGetFloat(parameters, "FrameTimeDeltaInMsec", floatValue))
+        snapshot.frameTimeDelta = floatValue;
 
     CaptureMatrix(parameters, "WorldToViewMatrix", snapshot.worldToView, snapshot.hasWorldToView);
     CaptureMatrix(parameters, "ViewToClipMatrix", snapshot.viewToClip, snapshot.hasViewToClip);
+    CaptureMatrix(parameters, "InvViewProjectionMatrix", snapshot.invViewProjection, snapshot.hasInvViewProjection);
+    CaptureMatrix(parameters, "ClipToPrevClipMatrix", snapshot.clipToPrevClip, snapshot.hasClipToPrevClip);
 
     snapshot.resources.reserve(Catalog.size());
     for (const auto& definition : Catalog)

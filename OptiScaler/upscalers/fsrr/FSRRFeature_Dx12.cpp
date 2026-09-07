@@ -6,6 +6,7 @@
 #include <State.h>
 #include <Util.h>
 #include <denoisers/RrInputRegistry.h>
+#include <inputs/DlssdExperimentalBackend.h>
 #include <denoisers/RrProfile.h>
 #include <denoisers/dx12/RrCanonicalizerDx12.h>
 #include <denoisers/ffx12/FfxRr12Provider.h>
@@ -280,7 +281,10 @@ FSRRFeatureDx12::FSRRFeatureDx12(unsigned int handleId, NVSDK_NGX_Parameter* par
 {
 }
 
-FSRRFeatureDx12::~FSRRFeatureDx12() = default;
+FSRRFeatureDx12::~FSRRFeatureDx12()
+{
+    DlssdExperimentalBackend::Release(Handle()->Id);
+}
 
 bool FSRRFeatureDx12::EvaluateFallback(ID3D12GraphicsCommandList* commandList,
                                       NVSDK_NGX_Parameter* parameters)
@@ -420,6 +424,31 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
     }
     else if (validation.issues.empty())
         _impl->lastWarningKey.clear();
+
+    if (const auto experimental = DlssdExperimentalBackend::Evaluate(Handle()->Id, snapshot, commandList, parameters);
+        experimental == DlssdExperimentalBackend::Decision::Dispatched)
+    {
+        _impl->lastFailureKey.clear();
+        return true;
+    }
+    else if (experimental == DlssdExperimentalBackend::Decision::Unpublished)
+    {
+        static std::once_flag loggedExperimentalUnpublished;
+        std::call_once(loggedExperimentalUnpublished,
+                       []
+                       {
+                           LOG_INFO("DLSS-D experimental backend ran unpublished; presenting the existing FSR-RR 1.2 path");
+                       });
+    }
+    else if (experimental == DlssdExperimentalBackend::Decision::Rejected)
+    {
+        static std::once_flag loggedExperimentalFallback;
+        std::call_once(loggedExperimentalFallback,
+                       []
+                       {
+                           LOG_WARN("DLSS-D experimental backend rejected; continuing the existing FSR-RR 1.2 path");
+                       });
+    }
 
     if (_impl->captureOnly)
     {

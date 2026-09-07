@@ -13,6 +13,10 @@ namespace DlssdQueueRendezvous
 {
 bool Enabled();
 void InstallForDevice(ID3D12Device* device);
+void PauseRecording();
+bool WaitUntilIdle(uint32_t timeoutMs);
+void PauseHipSubmissions();
+void Resume();
 bool RecordEvaluateTail(uint32_t handleId, ID3D12GraphicsCommandList* commandList);
 bool SubmissionContainsProbe(uint32_t commandListCount, ID3D12CommandList* const* commandLists);
 uint64_t BeforeExecuteCommandLists(ID3D12CommandQueue* queue, uint32_t commandListCount,

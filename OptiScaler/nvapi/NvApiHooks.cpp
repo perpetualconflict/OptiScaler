@@ -189,6 +189,33 @@ NvAPI_Status __stdcall NvApiHooks::hkNvAPI_DRS_GetSetting(NvDRSSessionHandle hSe
 
 void* __stdcall NvApiHooks::hkNvAPI_QueryInterface(unsigned int InterfaceId)
 {
+    // Dark CUDA/cubin IDs are not in fakenvapi. When the experimental backend
+    // has loaded dlssd_rr_bridge.dll, forward those IDs there. Do not merge
+    // the Rust translation stack into fakenvapi; Reflex/arch spoof stays here.
+    if (Config::Instance()->FSRRExperimentalDlssd.value_or_default())
+    {
+        constexpr unsigned int kBridgeOnlyIds[] = {
+            0x1dc7261f, 0x3151211b, 0x299f5fdc, 0x2a2c79e8, 0x5c52bb86, 0x7fb785ba, 0x329fe6e0,
+            0x0ddac234, 0x80403fc9, 0x48f5b2ee, 0x70c07832, 0xad1a677d, 0x7ab88d88, 0xe2436e22,
+            0x24973538, 0x846a9bf0, 0x41c65285, 0xdf295ea6,
+        };
+        for (unsigned int id : kBridgeOnlyIds)
+        {
+            if (id != InterfaceId)
+                continue;
+            if (HMODULE bridge = GetModuleHandleW(L"dlssd_rr_bridge.dll"))
+            {
+                if (auto query = reinterpret_cast<PFN_NvApi_QueryInterface>(
+                        KernelBaseProxy::GetProcAddress_()(bridge, "nvapi_QueryInterface")))
+                {
+                    if (void* fn = query(InterfaceId))
+                        return fn;
+                }
+            }
+            break;
+        }
+    }
+
     if (!o_NvAPI_QueryInterface)
         if (Config::Instance()->UseFakenvapi.value_or_default())
             o_NvAPI_QueryInterface = (PFN_NvApi_QueryInterface) fakenvapi::queryInterface;

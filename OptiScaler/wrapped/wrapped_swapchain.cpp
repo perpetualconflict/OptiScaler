@@ -9,6 +9,7 @@
 #include <hooks/D3D12_Hooks.h>
 
 #include <menu/menu_overlay_dx.h>
+#include <inputs/DlssdExperimentalBackend.h>
 
 #include <misc/FrameLimit.h>
 
@@ -326,6 +327,7 @@ static HRESULT LocalPresent(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT 
     // DXVK check, it's here because of upscaler time calculations
     if (IdentifyGpu::getPrimaryGpu().usesDxvk)
     {
+        DlssdExperimentalBackend::NotifyFrameSubmitted();
         if (pPresentParameters == nullptr)
             presentResult = pSwapChain->Present(SyncInterval, Flags);
         else

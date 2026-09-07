@@ -13,8 +13,10 @@
 #include <denoisers/dx12/shaders/DlssdQueueRendezvousWait_Shader.h>
 
 #include <array>
+#include <chrono>
 #include <filesystem>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -118,7 +120,10 @@ uint64_t NextSubmissionToken = 1;
 bool Initialized = false;
 bool InitializationFailed = false;
 bool RuntimeFailed = false;
+bool RecordingPaused = false;
+bool HipPaused = false;
 bool LoggedEnable = false;
+bool LoggedPauseSkip = false;
 uint32_t DetailLogs = 0;
 uint32_t FailureLogs = 0;
 
@@ -424,9 +429,86 @@ void ProcessCompletedLocked(ID3D12CommandQueue* queue)
         slot = {};
     }
 }
+
+bool HasInFlightLocked()
+{
+    for (const auto& slot : Slots)
+    {
+        if (slot.inUse)
+            return true;
+    }
+    return !PendingJobs.empty() || !SubmissionBatches.empty();
+}
+
+uint32_t InFlightCountLocked()
+{
+    uint32_t count = 0;
+    for (const auto& slot : Slots)
+    {
+        if (slot.inUse)
+            ++count;
+    }
+    for (const auto& [list, jobs] : PendingJobs)
+        count += static_cast<uint32_t>(jobs.size());
+    for (const auto& [token, jobs] : SubmissionBatches)
+        count += static_cast<uint32_t>(jobs.size());
+    return count;
+}
 } // namespace
 
 bool Enabled() { return Config::Instance()->FSRRTestDlssdQueueRendezvous.value_or_default(); }
+
+void PauseRecording()
+{
+    std::lock_guard lock(Mutex);
+    if (RecordingPaused)
+        return;
+    RecordingPaused = true;
+    LoggedPauseSkip = false;
+    LOG_INFO("DLSS-D rendezvous: paused recording so NGX create can own HIP");
+}
+
+bool WaitUntilIdle(uint32_t timeoutMs)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        {
+            std::lock_guard lock(Mutex);
+            if (!HasInFlightLocked())
+            {
+                LOG_INFO("DLSS-D rendezvous: idle before exclusive HIP");
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    uint32_t still = 0;
+    {
+        std::lock_guard lock(Mutex);
+        still = InFlightCountLocked();
+    }
+    LOG_WARN("DLSS-D rendezvous: still in flight after {} ms count={}", timeoutMs, still);
+    return still == 0;
+}
+
+void PauseHipSubmissions()
+{
+    std::lock_guard lock(Mutex);
+    HipPaused = true;
+    LOG_INFO("DLSS-D rendezvous: paused HIP submissions for NGX create");
+}
+
+void Resume()
+{
+    std::lock_guard lock(Mutex);
+    if (!RecordingPaused && !HipPaused)
+        return;
+    RecordingPaused = false;
+    HipPaused = false;
+    LoggedPauseSkip = false;
+    LOG_INFO("DLSS-D rendezvous: resumed after NGX create");
+}
 
 void InstallForDevice(ID3D12Device* device)
 {
@@ -457,6 +539,16 @@ bool RecordEvaluateTail(uint32_t handleId, ID3D12GraphicsCommandList* commandLis
         return false;
 
     std::lock_guard lock(Mutex);
+    if (RecordingPaused)
+    {
+        if (!LoggedPauseSkip)
+        {
+            LoggedPauseSkip = true;
+            LOG_INFO("DLSS-D rendezvous: skipped evaluate tails while NGX create owns HIP");
+        }
+        device->Release();
+        return false;
+    }
     const bool ready = InitializeLocked(device);
     device->Release();
     if (!ready || RuntimeFailed)
@@ -558,6 +650,16 @@ uint64_t BeforeExecuteCommandLists(ID3D12CommandQueue* queue, uint32_t commandLi
     }
     if (jobs.empty())
         return 0;
+    if (HipPaused)
+    {
+        for (const Job& job : jobs)
+        {
+            SlotState& slot = Slots[job.slot];
+            if (slot.inUse && slot.sequence == job.sequence)
+                slot = {};
+        }
+        return 0;
+    }
 
     uint64_t token = NextSubmissionToken++;
     if (token == 0)

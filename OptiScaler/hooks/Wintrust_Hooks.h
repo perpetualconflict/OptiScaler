@@ -7,6 +7,7 @@
 #include <Softpub.h>
 
 #include "Hook_Utils.h"
+#include <DllNames.h>
 
 typedef decltype(&WinVerifyTrust) PFN_WinVerifyTrust;
 static PFN_WinVerifyTrust o_WinVerifyTrust = nullptr;
@@ -32,7 +33,8 @@ static LONG hkWinVerifyTrust(HWND hwnd, GUID* pgActionID, LPVOID pWVTData)
 
     // This generally isn't needed but for some reason, when using SpecialK, our hooked CreateFileW doesn't get called
     // and WinVerifyTrust fails as nvngx.dll doesn't exist
-    if (path.contains("nvngx.dll") && State::Instance().nvngxReplacement.has_value())
+    if (path.contains("nvngx.dll") && !IsDlssdRuntimeSidecarNvngxA(path) &&
+        State::Instance().nvngxReplacement.has_value())
     {
         WINTRUST_DATA newData = *data;
         WINTRUST_FILE_INFO_ newFile = *newData.pFile;

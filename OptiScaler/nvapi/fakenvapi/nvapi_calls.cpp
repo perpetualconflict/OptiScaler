@@ -434,6 +434,33 @@ NvAPI_Status __cdecl NvAPI_D3D11_SetDepthBoundsTest(IUnknown* pDeviceOrContext)
         return NVAPI_OK; // return without logging
 }
 
+NvAPI_Status __cdecl NvAPI_D3D12_GetGraphicsCapabilities(IUnknown* pDevice, NvU32 structVersion, void* pGraphicsCaps)
+{
+    (void) structVersion;
+    if (!pDevice || !pGraphicsCaps)
+        return ERROR_VALUE(NVAPI_INVALID_ARGUMENT);
+
+    // Isolated DLSS-D Init uses the RR-bridge vendor-gate layout: public SM
+    // 8.9 plus CUDA SM 8.9 in the following reserved dword. The official V1
+    // header names that dword reserved[6]; keep the same 32-byte size.
+    struct GraphicsCaps
+    {
+        NvU32 flags;
+        NvU16 majorSMVersion;
+        NvU16 minorSMVersion;
+        NvU16 majorCudaSMVersion;
+        NvU16 minorCudaSMVersion;
+        NvU32 reserved[5];
+    };
+    auto* caps = static_cast<GraphicsCaps*>(pGraphicsCaps);
+    *caps = {};
+    caps->majorSMVersion = 8;
+    caps->minorSMVersion = 9;
+    caps->majorCudaSMVersion = 8;
+    caps->minorCudaSMVersion = 9;
+    return OK();
+}
+
 NvAPI_Status __cdecl NvAPI_D3D12_GetRaytracingCaps(IUnknown* invalid, NVAPI_D3D12_RAYTRACING_CAPS_TYPE type,
                                                    void* pData, size_t dataSize)
 {

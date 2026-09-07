@@ -18,6 +18,7 @@
 #include <inputs/FSR2_Dx12.h>
 #include <inputs/FSR3_Dx12.h>
 #include <inputs/FfxApiExe_Dx12.h>
+#include <inputs/DlssdTranslatedSession.h>
 
 #include <spoofing/Dxgi_Spoofing.h>
 
@@ -69,9 +70,17 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
     auto pos = libName.rfind(exePath);
 
-    if (Config::Instance()->EnableDlssInputs.value_or_default() && CheckDllNameW(&libName, &nvngxNamesW) &&
+    if (Config::Instance()->EnableDlssInputs.value_or_default() && ExactDllFileNameW(libName, &nvngxNamesW) &&
         (!Config::Instance()->HookOriginalNvngxOnly.value_or_default() || pos == std::string::npos))
     {
+        const wchar_t* requested = (lpLibFullPath != nullptr && lpLibFullPath[0] != L'\0') ? lpLibFullPath
+                                                                                           : libName.c_str();
+        if (IsDlssdRuntimeSidecarNvngxW(libName) || IsDlssdRuntimeSidecarNvngxW(requested))
+        {
+            LOG_INFO("nvngx sidecar caller: {}, loading without Streamline substitution", libNameA);
+            return NtdllProxy::LoadLibraryExW_Ldr(requested, NULL, 0);
+        }
+
         LOG_INFO("nvngx call: {0}, returning this dll!", libNameA);
 
         // if (!dontCount)
@@ -83,6 +92,13 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
     if ((State::Instance().workingMode != WorkingMode::Dxgi || !State::Instance().skipDxgiLoadChecks) &&
         CheckDllNameW(&libName, &dllNamesW))
     {
+        if (DlssdTranslatedSession::AttachLoadBypassActive())
+        {
+            LOG_INFO("{} call during DLSS-D attach, not returning this dll", libNameA);
+            if (originalModule != nullptr)
+                return originalModule;
+            return NtdllProxy::LoadLibraryExW_Ldr(L"dxgi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        }
         if (!State::Instance().ServeOriginal())
         {
             LOG_INFO("{} call, returning this dll!", libNameA);
@@ -129,9 +145,17 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
         return loadedBin;
     }
 
-    // NvApi64.dll
-    if (CheckDllNameW(&libName, &nvapiNamesW))
+    // NvApi64.dll — exact basename only. Suffix match steals sidecar bridges
+    // whose filenames end with nvapi64.dll.
+    if (ExactDllFileNameW(libName, &nvapiNamesW))
     {
+        if (DlssdTranslatedSession::AttachLoadBypassActive())
+        {
+            if (HMODULE bridge = DlssdTranslatedSession::LoadSidecarNvapiForAttach())
+                return bridge;
+            LOG_WARN("{} call during DLSS-D attach, sidecar bridge missing", libNameA);
+            return nullptr;
+        }
         LOG_INFO("{} call!", libNameA);
 
         return LibraryLoadHooks::LoadNvApi();

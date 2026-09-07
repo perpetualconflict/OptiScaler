@@ -5,6 +5,7 @@
 #include <wincrypt.h>
 
 #include "Hook_Utils.h"
+#include <DllNames.h>
 #include <fsr4/FSR4Upgrade.h>
 
 typedef decltype(&CryptQueryObject) PFN_CryptQueryObject;
@@ -36,8 +37,8 @@ static BOOL hkCryptQueryObject(DWORD dwObjectType, const void* pvObject, DWORD d
                                       phMsg, ppvContext);
         }
 
-        if (pathString.contains("nvngx.dll") && !State::Instance().nvngxExists &&
-            State::Instance().nvngxReplacement.has_value() &&
+        if (pathString.contains("nvngx.dll") && !IsDlssdRuntimeSidecarNvngxA(pathString) &&
+            !State::Instance().nvngxExists && State::Instance().nvngxReplacement.has_value() &&
             (Config::Instance()->DxgiSpoofing.value_or_default() ||
              Config::Instance()->StreamlineSpoofing.value_or_default()))
         {

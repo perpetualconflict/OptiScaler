@@ -2995,6 +2995,14 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
                        "not touch DLSS-D image data and disables itself after any timeout or mismatch.\n"
                        "Save settings and restart the game.");
 
+        bool experimentalDlssd = config->FSRRExperimentalDlssd.value_or_default();
+        if (ImGui::Checkbox("Experimental Translated DLSS-D", &experimentalDlssd))
+            config->FSRRExperimentalDlssd = experimentalDlssd;
+        ShowHelpMarker("Opt-in gate at the NGX Ray Reconstruction seam. Accepts Cyberpunk Quality\n"
+                       "1706x960 to 2560x1440 and isolated Full-HD 1920x1080 to 3840x2160 signed 310.7.\n"
+                       "Dispatch is a blocking separate-queue translated evaluate of game copies, not\n"
+                       "same-command-list HIP insertion. Failures keep FSR-RR. Save and restart.");
+
         ImGui::BeginDisabled(!enabled);
 
         bool captureOnly = config->FSRRCaptureOnly.value_or_default();

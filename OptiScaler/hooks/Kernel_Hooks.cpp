@@ -4,12 +4,14 @@
 #include "Gdi32_Hooks.h"
 #include "Streamline_Hooks.h"
 #include "LibraryLoad_Hooks.h"
+#include <inputs/DlssdTranslatedSession.h>
 
 #include <fsr4/FSR4ModelSelection.h>
 
 #include <Util.h>
 #include <State.h>
 #include <Config.h>
+#include <DllNames.h>
 
 #include <cwctype>
 #include <misc/IdentifyGpu.h>
@@ -18,6 +20,23 @@
 
 #include "Amdxc64_Hooks.h"
 #pragma intrinsic(_ReturnAddress)
+
+static bool IsNvapi64A(LPCSTR name)
+{
+    return name != nullptr && (_stricmp(name, "nvapi64.dll") == 0 || _stricmp(name, "nvapi64") == 0);
+}
+
+static bool IsNvapi64W(LPCWSTR name)
+{
+    return name != nullptr && (lstrcmpiW(name, L"nvapi64.dll") == 0 || lstrcmpiW(name, L"nvapi64") == 0);
+}
+
+static HMODULE NvapiModuleDuringAttach()
+{
+    if (!DlssdTranslatedSession::AttachLoadBypassActive())
+        return nullptr;
+    return DlssdTranslatedSession::NvapiHandleForAttach();
+}
 
 static inline void NormalizePath(std::string& path)
 {
@@ -126,6 +145,8 @@ FARPROC WINAPI KernelHooks::hk_K32_GetProcAddress(HMODULE hModule, LPCSTR lpProc
 VALIDATE_HOOK(hk_K32_GetModuleHandleA, Kernel32Proxy::PFN_GetModuleHandleA)
 HMODULE WINAPI KernelHooks::hk_K32_GetModuleHandleA(LPCSTR lpModuleName)
 {
+    if (HMODULE nvapi = NvapiModuleDuringAttach(); nvapi != nullptr && IsNvapi64A(lpModuleName))
+        return nvapi;
     if (lpModuleName != NULL)
     {
         if (strcmp(lpModuleName, "nvngx_dlssg.dll") == 0)
@@ -164,6 +185,8 @@ HMODULE WINAPI KernelHooks::hk_K32_GetModuleHandleA(LPCSTR lpModuleName)
 VALIDATE_HOOK(hk_K32_GetModuleHandleW, Kernel32Proxy::PFN_GetModuleHandleW)
 HMODULE WINAPI KernelHooks::hk_K32_GetModuleHandleW(LPCWSTR lpModuleName)
 {
+    if (HMODULE nvapi = NvapiModuleDuringAttach(); nvapi != nullptr && IsNvapi64W(lpModuleName))
+        return nvapi;
     if (lpModuleName != NULL)
     {
         if (wcscmp(lpModuleName, L"amdxc64.dll") == 0)
@@ -192,6 +215,14 @@ HMODULE WINAPI KernelHooks::hk_K32_GetModuleHandleW(LPCWSTR lpModuleName)
 VALIDATE_HOOK(hk_K32_GetModuleHandleExA, Kernel32Proxy::PFN_GetModuleHandleExA)
 BOOL WINAPI KernelHooks::hk_K32_GetModuleHandleExA(DWORD dwFlags, LPCSTR lpModuleName, HMODULE* phModule)
 {
+    if (phModule && !(dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) && IsNvapi64A(lpModuleName))
+    {
+        if (HMODULE nvapi = NvapiModuleDuringAttach())
+        {
+            *phModule = nvapi;
+            return TRUE;
+        }
+    }
     if (lpModuleName && dwFlags == 0 && strcmp("libxell.dll", lpModuleName) == 0 && phModule)
     {
         *phModule = dllModule;
@@ -204,12 +235,19 @@ BOOL WINAPI KernelHooks::hk_K32_GetModuleHandleExA(DWORD dwFlags, LPCSTR lpModul
 VALIDATE_HOOK(hk_K32_GetModuleHandleExW, Kernel32Proxy::PFN_GetModuleHandleExW)
 BOOL WINAPI KernelHooks::hk_K32_GetModuleHandleExW(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE* phModule)
 {
-    if (lpModuleName && dwFlags == GET_MODULE_HANDLE_EX_FLAG_PIN && lstrcmpW(L"nvapi64.dll", lpModuleName) == 0 &&
-        phModule)
+    if (phModule && !(dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) && IsNvapi64W(lpModuleName))
     {
-        LOG_TRACE("Suspected SpecialK call for nvapi64");
-        *phModule = LibraryLoadHooks::LoadNvApi();
-        return true;
+        if (HMODULE nvapi = NvapiModuleDuringAttach())
+        {
+            *phModule = nvapi;
+            return TRUE;
+        }
+        if (dwFlags == GET_MODULE_HANDLE_EX_FLAG_PIN)
+        {
+            LOG_TRACE("Suspected SpecialK call for nvapi64");
+            *phModule = LibraryLoadHooks::LoadNvApi();
+            return TRUE;
+        }
     }
 
     return o_K32_GetModuleHandleExW(dwFlags, lpModuleName, phModule);
@@ -245,7 +283,7 @@ DWORD WINAPI KernelHooks::hk_K32_GetFileAttributesW(LPCWSTR lpFileName)
         auto path = wstring_to_string(std::wstring(lpFileName));
         to_lower_in_place(path);
 
-        if (path.contains("nvngx.dll") && !path.contains("_nvngx.dll") &&
+        if (path.contains("nvngx.dll") && !path.contains("_nvngx.dll") && !IsDlssdRuntimeSidecarNvngxA(path) &&
             !IsInsideWindowsDirectory(path)) // apply the override to just one path
         {
             LOG_DEBUG("Overriding GetFileAttributesW for nvngx");
@@ -268,7 +306,7 @@ HANDLE WINAPI KernelHooks::hk_K32_CreateFileW(LPCWSTR lpFileName, DWORD dwDesire
         auto path = wstring_to_string(std::wstring(lpFileName));
         to_lower_in_place(path);
 
-        if (path.contains("nvngx.dll") && !path.contains("_nvngx.dll") && // apply the override to just one path
+        if (path.contains("nvngx.dll") && !path.contains("_nvngx.dll") && !IsDlssdRuntimeSidecarNvngxA(path) &&
             !IsInsideWindowsDirectory(path))
         {
             static auto& signedDll = State::Instance().nvngxReplacement;

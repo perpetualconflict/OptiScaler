@@ -126,10 +126,15 @@ struct InputSnapshot
     std::optional<float> sharpness;
     std::optional<float> preExposure;
     std::optional<float> exposureScale;
+    std::optional<float> frameTimeDelta;
     std::array<float, 16> worldToView {};
     std::array<float, 16> viewToClip {};
+    std::array<float, 16> invViewProjection {};
+    std::array<float, 16> clipToPrevClip {};
     bool hasWorldToView = false;
     bool hasViewToClip = false;
+    bool hasInvViewProjection = false;
+    bool hasClipToPrevClip = false;
     std::vector<ResourceInput> resources;
 
     const ResourceInput* Find(InputSemantic semantic) const;

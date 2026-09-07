@@ -5,6 +5,7 @@
 #include <proxies/KernelBase_Proxy.h>
 
 #include <cwctype> // for std::towlower
+#include <filesystem>
 
 #define DEFINE_NAME_VECTORS(varName, ...)                                                                              \
     inline std::vector<std::string> varName##Names = []                                                                \
@@ -209,6 +210,39 @@ inline static bool CheckDllNameW(std::wstring* dllName, std::vector<std::wstring
     }
 
     return false;
+}
+
+// Reserved NGX/NVAPI identity is the exact basename. Suffix match treats
+// dlssd_runtime_nvngx.dll as nvngx.dll and steals ProbeNvngx_* exports.
+inline static bool ExactDllFileNameW(const std::wstring& pathOrName, const std::vector<std::wstring>* namesList)
+{
+    auto fileName = std::filesystem::path(pathOrName).filename().wstring();
+    for (auto name : *namesList)
+    {
+        if (fileName.size() == name.size() && CompareFileNameW(&fileName, &name))
+            return true;
+    }
+
+    return false;
+}
+
+// Signed nvngx_dlssd requires NGX entry points from a module named nvngx.dll.
+// After Streamline's handshake, game attach may Ldr-load that basename only
+// from OptiScaler/dlssd_runtime/. Never treat the game-folder or a bare
+// nvngx.dll name as this sidecar, and never do the same for nvapi64.dll.
+inline static bool IsDlssdRuntimeSidecarNvngxW(const std::wstring& pathOrName)
+{
+    if (pathOrName.empty())
+        return false;
+    const auto path = std::filesystem::path(pathOrName);
+    if (_wcsicmp(path.filename().c_str(), L"nvngx.dll") != 0)
+        return false;
+    return _wcsicmp(path.parent_path().filename().c_str(), L"dlssd_runtime") == 0;
+}
+
+inline static bool IsDlssdRuntimeSidecarNvngxA(const std::string& pathOrName)
+{
+    return IsDlssdRuntimeSidecarNvngxW(std::wstring(pathOrName.begin(), pathOrName.end()));
 }
 
 inline static HMODULE GetDllNameModule(std::vector<std::string>* namesList)
