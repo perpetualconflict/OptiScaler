@@ -159,6 +159,7 @@ std::atomic<bool> gOwnerBusy { false };
 // detach-and-leak the hung owner once, poison the path, and never start a
 // second owner that would compete for ZLUDA TLS and device hooks.
 std::atomic<bool> gOwnerHungLeaked { false };
+std::atomic<bool> gOwnerAlive { false };
 bool gShutdown = false;
 OwnerJob gJob;
 OwnerJob gPending;
@@ -617,6 +618,14 @@ void OwnerLoop()
         DlssdTranslatedSession::ScopedAttachLoadBypass bindBypass;
         DlssdTranslatedSession::BindCudaOnThisThread();
     }
+    // Liveness for teardown diagnostics: a lingering process with this false
+    // means the hung owner returned late (or never started), so the sidecar
+    // release path may proceed without touching a blocked thread.
+    struct AliveGuard
+    {
+        ~AliveGuard() { gOwnerAlive.store(false, std::memory_order_release); }
+    } aliveGuard;
+    gOwnerAlive.store(true, std::memory_order_release);
     LOG_INFO("DLSS-D experimental backend NGX owner tid={}", GetCurrentThreadId());
     FlushExperimentalLog();
     for (;;)
@@ -1240,6 +1249,10 @@ void Release(uint32_t handleId)
 {
     if (!Enabled())
         return;
+    LOG_INFO("DLSS-D experimental backend release enter creating={} owner_alive={} hung_leaked={}",
+             DlssdTranslatedSession::IsCreating() ? 1 : 0, gOwnerAlive.load(std::memory_order_acquire) ? 1 : 0,
+             gOwnerHungLeaked.load(std::memory_order_acquire) ? 1 : 0);
+    FlushExperimentalLog();
     StopOwner(DlssdTranslatedSession::IsCreating());
     DlssdTranslatedSession::Release();
     gHaveLastKey = false;

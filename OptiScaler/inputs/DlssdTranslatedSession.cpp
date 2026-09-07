@@ -613,6 +613,28 @@ void Release()
     std::unique_lock lock(gLock);
     if (gAbandoned.load(std::memory_order_acquire))
     {
+        // Dump verdict 2026-09-07: by process exit the hung owner is gone
+        // (linger is a single thread inside nvngx_dlssd detach -> bridge
+        // Unregister -> infinite WaitOnAddress). A cleared gCreating with
+        // prepared/attached state means the hung NGX create returned late,
+        // so no thread is inside the runtime anymore: run the normal sidecar
+        // release to unregister bridge resources instead of leaking them
+        // into detach. Poison flags stay set, so this never re-arms attach.
+        if (!gCreating.load(std::memory_order_acquire) &&
+            (gPrepared.load(std::memory_order_acquire) || gAttached.load(std::memory_order_acquire)) &&
+            gRelease != nullptr)
+        {
+            LOG_INFO("DLSS-D experimental backend late-releasing abandoned sidecar after the hung owner returned");
+            if (auto logger = spdlog::default_logger())
+                logger->flush();
+            ReleasePreparedRuntimeLocked();
+            gAttachedRenderWidth = 0;
+            gAttachedRenderHeight = 0;
+            gAttachedOutputWidth = 0;
+            gAttachedOutputHeight = 0;
+            LOG_WARN("DLSS-D experimental backend released abandoned sidecar late; path stays poisoned");
+            return;
+        }
         gCallerShim = nullptr;
         gSidecarNvapi = nullptr;
         gAttached.store(false, std::memory_order_release);
