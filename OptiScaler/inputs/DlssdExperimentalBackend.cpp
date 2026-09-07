@@ -22,6 +22,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -53,6 +54,19 @@ std::atomic<uint32_t> gRejectedInventory { 0 };
 std::atomic<uint32_t> gRejectedRuntime { 0 };
 std::atomic<uint32_t> gSkippedUnsafe { 0 };
 std::atomic<uint32_t> gDispatched { 0 };
+// Host-granularity owner-evaluate outcome inventory for backwards debugging:
+// the sidecar only reports ok/fail plus an error string, so unique failure
+// texts are counted here to point at descriptor/translation faults per run.
+std::atomic<uint32_t> gOwnerOk { 0 };
+std::atomic<uint32_t> gOwnerFailed { 0 };
+std::atomic<uint32_t> gPublished { 0 };
+std::mutex gFailInventoryMutex;
+struct FailEntry
+{
+    std::string text;
+    uint32_t count = 0;
+};
+std::array<FailEntry, 4> gFailInventory {};
 std::once_flag gLoggedContract;
 std::atomic<bool> gRuntimePoisoned { false };
 Clock::time_point gLastEvaluateExit {};
@@ -213,6 +227,62 @@ void FlushExperimentalLog()
         logger->flush();
 }
 
+// Parked by default: the sidecar's first-Evaluate lazy init (seq-39 allocs +
+// copy-ins) AV'd twice on game-heap addresses, so no owner work runs until
+// explicitly opted in. Attach + quiesce + FSR-RR presentation are unaffected.
+bool OwnerEvaluatesAllowed()
+{
+    return Config::Instance()->FSRRDlssdOwnerEvaluates.value_or_default();
+}
+
+bool PresentTranslatedAllowed()
+{
+    return OwnerEvaluatesAllowed() && Config::Instance()->FSRRDlssdPresentTranslated.value_or_default();
+}
+
+bool PostAttachParked()
+{
+    return DlssdTranslatedSession::IsAttached() && !OwnerEvaluatesAllowed();
+}
+
+void NoteOwnerFailure(const char* error)
+{
+    const uint32_t total = gOwnerFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::string text = (error != nullptr && error[0] != '\0') ? error : "unknown";
+    if (text.size() > 160)
+        text.resize(160);
+    std::string inventory;
+    {
+        std::lock_guard lock(gFailInventoryMutex);
+        bool found = false;
+        for (auto& entry : gFailInventory)
+        {
+            if (entry.count > 0 && entry.text == text)
+            {
+                entry.count++;
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+        {
+            for (size_t i = gFailInventory.size() - 1; i > 0; --i)
+                gFailInventory[i] = std::move(gFailInventory[i - 1]);
+            gFailInventory[0] = FailEntry { text, 1 };
+        }
+        for (const auto& entry : gFailInventory)
+        {
+            if (entry.count == 0)
+                continue;
+            if (!inventory.empty())
+                inventory += " | ";
+            inventory += std::to_string(entry.count) + "x " + entry.text;
+        }
+    }
+    LOG_WARN("DLSS-D experimental backend owner evaluate failed fail_total={} fails=[{}]", total, inventory);
+    FlushExperimentalLog();
+}
+
 void LogContractOnce()
 {
     std::call_once(gLoggedContract,
@@ -229,6 +299,10 @@ void LogContractOnce()
                                   "heartbeat progresses and fails closed on a 45 s stall. "
                                   "After attach, a 120 s post-attach quiesce keeps FSR-RR with no "
                                   "caller-list copies and no owner evaluates while the sidecar settles. "
+                                  "Owner evaluates are parked by default ([FSRR] DlssdOwnerEvaluates) "
+                                  "after two post-attach AVs in the sidecar lazy init; the present "
+                                  "toggle ([FSRR] DlssdPresentTranslated, default off) only takes "
+                                  "effect with owner evaluates allowed. "
                                   "Failures keep FSR-RR. Probe 2026-09-07: minimal gates active, "
                                  "settle/vram/inworld stability skipped, VRAM log-only at 2 Hz, hung "
                                  "owner detached without TerminateThread.");
@@ -238,9 +312,10 @@ void LogContractOnce()
 void LogCounters(uint32_t handleId, const char* reason)
 {
     LOG_WARN("DLSS-D experimental backend handle={} {}: evaluated={} extent={} capture_only={} "
-             "inventory={} runtime={} skipped={} dispatched={}",
+             "inventory={} runtime={} skipped={} dispatched={} owner_ok={} owner_fail={} published={}",
              handleId, reason, gEvaluated.load(), gRejectedExtent.load(), gRejectedCaptureOnly.load(),
-             gRejectedInventory.load(), gRejectedRuntime.load(), gSkippedUnsafe.load(), gDispatched.load());
+             gRejectedInventory.load(), gRejectedRuntime.load(), gSkippedUnsafe.load(), gDispatched.load(),
+             gOwnerOk.load(), gOwnerFailed.load(), gPublished.load());
 }
 
 const void* ResourcePointer(const InputSnapshot& snapshot, InputSemantic semantic)
@@ -705,8 +780,9 @@ void OwnerLoop()
                 gAttachReadyAt = Clock::now();
                 gHaveAttachReady = true;
                 LOG_INFO("DLSS-D experimental backend handle={} finish attach ok ms={} tid={} "
-                         "post_attach_quiesce_ms={}",
-                         job.handleId, elapsedMs, GetCurrentThreadId(), kPostAttachQuiesceMs);
+                         "post_attach_quiesce_ms={} parked={}",
+                         job.handleId, elapsedMs, GetCurrentThreadId(), kPostAttachQuiesceMs,
+                         OwnerEvaluatesAllowed() ? 0 : 1);
                 FlushExperimentalLog();
             }
         }
@@ -716,10 +792,14 @@ void OwnerLoop()
             const auto enter = Clock::now();
             bool ok = WaitGameQueue(job.queue, 2000);
             const bool waitFailed = !ok;
+            // End-to-end wiring: the present toggle only reaches the sidecar
+            // when owner evaluates are allowed. While parked this branch never
+            // runs, so the default-off toggle cannot publish on its own.
+            const bool present = PresentTranslatedAllowed();
             if (!ok)
                 error = "game queue wait failed before unpublished evaluate";
             else
-                ok = DlssdTranslatedSession::Evaluate(nullptr, job.snapshot, nullptr, false, &error,
+                ok = DlssdTranslatedSession::Evaluate(nullptr, job.snapshot, nullptr, present, &error,
                                                       DlssdRuntimeFrame_SkipInputCopy);
             const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - enter).count();
             ReleaseJob(job);
@@ -733,6 +813,7 @@ void OwnerLoop()
             }
             else if (!ok)
             {
+                NoteOwnerFailure(error);
                 DlssdTranslatedSession::Release();
                 gRuntimePoisoned.store(true, std::memory_order_relaxed);
                 gRejectedRuntime.fetch_add(1, std::memory_order_relaxed);
@@ -743,11 +824,23 @@ void OwnerLoop()
             }
             else
             {
+                gOwnerOk.fetch_add(1, std::memory_order_relaxed);
                 const auto dispatched = gDispatched.fetch_add(1, std::memory_order_relaxed) + 1;
-                LOG_INFO("DLSS-D experimental backend handle={} evaluate exit ok=1 publish=0 ms={} dispatched={} "
-                         "extent={} tid={}",
-                         job.handleId, elapsedMs, dispatched, job.extent != nullptr ? job.extent->name : "none",
-                         GetCurrentThreadId());
+                if (present)
+                {
+                    gPublished.fetch_add(1, std::memory_order_relaxed);
+                    LOG_WARN("DLSS-D experimental backend handle={} PUBLISHED translated output over the game "
+                             "output (FSR-RR output overwritten) ms={} dispatched={} extent={} tid={}",
+                             job.handleId, elapsedMs, dispatched,
+                             job.extent != nullptr ? job.extent->name : "none", GetCurrentThreadId());
+                }
+                else
+                {
+                    LOG_INFO("DLSS-D experimental backend handle={} evaluate exit ok=1 publish=0 ms={} dispatched={} "
+                             "extent={} tid={}",
+                             job.handleId, elapsedMs, dispatched, job.extent != nullptr ? job.extent->name : "none",
+                             GetCurrentThreadId());
+                }
                 FlushExperimentalLog();
             }
         }
@@ -1042,6 +1135,11 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     if (commandList == nullptr)
         return SkipUnsafe(handleId, "missing_cmdlist", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
 
+    // Parked by default ([FSRR] DlssdOwnerEvaluates): never reach the quiesce
+    // window, caller-list copies, or owner work while not opted in.
+    if (PostAttachParked())
+        return SkipUnsafe(handleId, "post_attach_parked", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -2);
+
     // Post-attach quiesce: no caller-list copies and no owner evaluates until
     // the window elapses. The sidecar otherwise keeps allocating (seq=39) and
     // copying in concurrently with game evaluates.
@@ -1310,6 +1408,18 @@ void NotifyFrameSubmitted()
         return;
     if (!DlssdTranslatedSession::IsAttached() || DlssdTranslatedSession::IsCreating())
         return;
+    // Parked by default: drop any pending work (releasing its queue/resource
+    // refs) instead of dispatching owner evaluates while not opted in.
+    if (PostAttachParked())
+    {
+        std::lock_guard lock(gJobMutex);
+        if (gHavePending)
+        {
+            ReleaseJob(gPending);
+            gHavePending = false;
+        }
+        return;
+    }
     // Post-attach quiesce: drop any pre-attach pending work (releasing its
     // queue/resource refs) instead of dispatching owner evaluates while the
     // sidecar still settles.
@@ -1396,8 +1506,9 @@ void Release(uint32_t handleId)
     gVramSawClimb = false;
     ReleaseCachedVramAdapter();
     LOG_INFO("DLSS-D experimental backend released handle={} evaluated={} extent={} capture_only={} "
-             "inventory={} runtime={} skipped={} dispatched={}",
+             "inventory={} runtime={} skipped={} dispatched={} owner_ok={} owner_fail={} published={}",
              handleId, gEvaluated.load(), gRejectedExtent.load(), gRejectedCaptureOnly.load(),
-             gRejectedInventory.load(), gRejectedRuntime.load(), gSkippedUnsafe.load(), gDispatched.load());
+             gRejectedInventory.load(), gRejectedRuntime.load(), gSkippedUnsafe.load(), gDispatched.load(),
+             gOwnerOk.load(), gOwnerFailed.load(), gPublished.load());
 }
 } // namespace DlssdExperimentalBackend

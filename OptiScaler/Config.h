@@ -281,6 +281,13 @@ class Config
     CustomOptional<bool> FSRRTraceDlssdOutputOrdering { false };
     CustomOptional<bool> FSRRTestDlssdQueueRendezvous { false };
     CustomOptional<bool> FSRRExperimentalDlssd { false };
+    // Owner evaluates run the sidecar's first-Evaluate lazy init (seq-39 allocs
+    // + copy-ins), which AV'd twice on game-heap addresses. Parked by default:
+    // attach + quiesce only, never dispatch owner work until opted in.
+    CustomOptional<bool> FSRRDlssdOwnerEvaluates { false };
+    // Present translated output instead of FSR-RR. Requires owner evaluates.
+    // Default off, fail-closed: validation failures keep FSR-RR.
+    CustomOptional<bool> FSRRDlssdPresentTranslated { false };
     CustomOptional<int> FSRRDebugOutput { 0 };
 
     // Nukems

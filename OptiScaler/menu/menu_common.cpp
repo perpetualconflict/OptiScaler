@@ -3003,6 +3003,29 @@ void MenuCommon::RenderFsrRayRegenerationSettings(RenderMenuContext& ctx)
                        "Dispatch is a blocking separate-queue translated evaluate of game copies, not\n"
                        "same-command-list HIP insertion. Failures keep FSR-RR. Save and restart.");
 
+        ImGui::BeginDisabled(!experimentalDlssd);
+
+        bool ownerEvaluates = config->FSRRDlssdOwnerEvaluates.value_or_default();
+        if (ImGui::Checkbox("Allow Translated Owner Evaluates", &ownerEvaluates))
+            config->FSRRDlssdOwnerEvaluates = ownerEvaluates;
+        ShowHelpMarker("Lets the sidecar owner thread run translated evaluates after attach and the\n"
+                       "post-attach quiesce. Parked by default: the sidecar's first-evaluate lazy\n"
+                       "init crashed twice, so attach + quiesce + FSR-RR presentation is all that\n"
+                       "runs until this is on. Isolated-harness debugging first. Save and restart.");
+
+        ImGui::BeginDisabled(!ownerEvaluates);
+
+        bool presentTranslated = config->FSRRDlssdPresentTranslated.value_or_default();
+        if (ImGui::Checkbox("Present Translated Output", &presentTranslated))
+            config->FSRRDlssdPresentTranslated = presentTranslated;
+        ShowHelpMarker("DANGER: presents the translated DLSS-D output instead of FSR-RR in the same\n"
+                       "session for A/B comparison. First frames may be visually wrong; that output\n"
+                       "is the diagnostic. Requires owner evaluates. Validation failures fail closed\n"
+                       "to FSR-RR. Save settings and restart the game after changing this option.");
+
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+
         ImGui::BeginDisabled(!enabled);
 
         bool captureOnly = config->FSRRCaptureOnly.value_or_default();
