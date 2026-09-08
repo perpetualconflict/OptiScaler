@@ -807,8 +807,19 @@ void OwnerLoop()
             if (!ok)
                 error = "game queue wait failed before unpublished evaluate";
             else
+            {
+                // Sparse owner samples are separated by many game frames.
+                // Their motion describes adjacent game frames, not the prior
+                // private sample. Reset only this diagnostic job's history.
+                const auto requestedReset = job.snapshot.reset;
+                job.snapshot.reset = 1;
+                LOG_INFO("DLSS-D experimental backend handle={} owner evaluate reset_requested={} reset_effective={} "
+                         "reason=sparse_owner_history",
+                         job.handleId, requestedReset, job.snapshot.reset);
+                FlushExperimentalLog();
                 ok = DlssdTranslatedSession::Evaluate(nullptr, job.snapshot, nullptr, false, &error,
                                                       DlssdRuntimeFrame_SkipInputCopy);
+            }
             const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - enter).count();
             ReleaseJob(job);
 

@@ -17,6 +17,15 @@ output handoff is unavailable. Successful owner evaluations still count as
 diagnostic execution; `published` remains zero. No per-host warmup count is
 used to establish output validity.
 
+Owner evaluations are sparse diagnostics, normally separated by two seconds.
+Game motion vectors relate adjacent game frames, so they cannot connect those
+private samples to the private backend's previous history. Every owner job now
+forces its private snapshot's reset to one and logs requested/effective reset.
+This also resets the first private evaluation after attach. The caller's
+snapshot and game behavior are unchanged; the standalone consecutive-frame
+history probe retains its own reset policy. This corrects history continuity
+semantics but is not evidence that missing reset caused the observed NaNs.
+
 Before removing the gate, provide an owned completion resource and fence,
 generation and resolution matching, output lifetime protection, correct
 subrect/state handling on the current NGX caller list, and fallback suppression
