@@ -235,9 +235,17 @@ bool OwnerEvaluatesAllowed()
     return Config::Instance()->FSRRDlssdOwnerEvaluates.value_or_default();
 }
 
-bool PresentTranslatedAllowed()
+void LogPublicationUnavailable()
 {
-    return OwnerEvaluatesAllowed() && Config::Instance()->FSRRDlssdPresentTranslated.value_or_default();
+    if (!Config::Instance()->FSRRDlssdPresentTranslated.value_or_default())
+        return;
+    static std::once_flag logged;
+    std::call_once(logged, []
+                   {
+                       LOG_WARN("DLSS-D experimental backend publication unavailable: caller-list output handoff "
+                                "not implemented; DlssdPresentTranslated remains requested, owner evaluations "
+                                "stay unpublished and FSR-RR remains the presented output");
+                   });
 }
 
 bool PostAttachParked()
@@ -301,8 +309,8 @@ void LogContractOnce()
                                   "caller-list copies and no owner evaluates while the sidecar settles. "
                                   "Owner evaluates are parked by default ([FSRR] DlssdOwnerEvaluates) "
                                   "after two post-attach AVs in the sidecar lazy init; the present "
-                                  "toggle ([FSRR] DlssdPresentTranslated, default off) only takes "
-                                  "effect with owner evaluates allowed. "
+                                  "toggle ([FSRR] DlssdPresentTranslated, default off) remains gated "
+                                  "until caller-list output handoff is implemented. "
                                   "Failures keep FSR-RR. Probe 2026-09-07: minimal gates active, "
                                  "settle/vram/inworld stability skipped, VRAM log-only at 2 Hz, hung "
                                  "owner detached without TerminateThread.");
@@ -792,14 +800,14 @@ void OwnerLoop()
             const auto enter = Clock::now();
             bool ok = WaitGameQueue(job.queue, 2000);
             const bool waitFailed = !ok;
-            // End-to-end wiring: the present toggle only reaches the sidecar
-            // when owner evaluates are allowed. While parked this branch never
-            // runs, so the default-off toggle cannot publish on its own.
-            const bool present = PresentTranslatedAllowed();
+            // The queue wait only orders earlier input copies. It does not
+            // grant the owner exclusive access to a live game output or order
+            // its consumers. Keep validated output private until a completion
+            // handoff can record publication on the current NGX caller list.
             if (!ok)
                 error = "game queue wait failed before unpublished evaluate";
             else
-                ok = DlssdTranslatedSession::Evaluate(nullptr, job.snapshot, nullptr, present, &error,
+                ok = DlssdTranslatedSession::Evaluate(nullptr, job.snapshot, nullptr, false, &error,
                                                       DlssdRuntimeFrame_SkipInputCopy);
             const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - enter).count();
             ReleaseJob(job);
@@ -826,21 +834,10 @@ void OwnerLoop()
             {
                 gOwnerOk.fetch_add(1, std::memory_order_relaxed);
                 const auto dispatched = gDispatched.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (present)
-                {
-                    gPublished.fetch_add(1, std::memory_order_relaxed);
-                    LOG_WARN("DLSS-D experimental backend handle={} PUBLISHED translated output over the game "
-                             "output (FSR-RR output overwritten) ms={} dispatched={} extent={} tid={}",
-                             job.handleId, elapsedMs, dispatched,
-                             job.extent != nullptr ? job.extent->name : "none", GetCurrentThreadId());
-                }
-                else
-                {
-                    LOG_INFO("DLSS-D experimental backend handle={} evaluate exit ok=1 publish=0 ms={} dispatched={} "
-                             "extent={} tid={}",
-                             job.handleId, elapsedMs, dispatched, job.extent != nullptr ? job.extent->name : "none",
-                             GetCurrentThreadId());
-                }
+                LOG_INFO("DLSS-D experimental backend handle={} evaluate exit ok=1 publish=0 ms={} dispatched={} "
+                         "extent={} tid={}",
+                         job.handleId, elapsedMs, dispatched, job.extent != nullptr ? job.extent->name : "none",
+                         GetCurrentThreadId());
                 FlushExperimentalLog();
             }
         }
@@ -1203,6 +1200,7 @@ Decision Evaluate(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Graphi
         return Decision::NotEnabled;
 
     LogContractOnce();
+    LogPublicationUnavailable();
     gEvaluated.fetch_add(1, std::memory_order_relaxed);
 
     if (Config::Instance()->FSRRCaptureOnly.value_or_default())
