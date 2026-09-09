@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "DlssdFenceWait.h"
 
 #include "DlssdExperimentalBackend.h"
 #include "DlssdTranslatedSession.h"
@@ -725,11 +726,7 @@ bool WaitGameQueue(ID3D12CommandQueue* queue, DWORD timeoutMs)
     const auto value = ++gWaitValue;
     if (FAILED(queue->Signal(gWaitFence, value)))
         return false;
-    if (gWaitFence->GetCompletedValue() >= value)
-        return true;
-    if (FAILED(gWaitFence->SetEventOnCompletion(value, gWaitEvent)))
-        return false;
-    return WaitForSingleObject(gWaitEvent, timeoutMs) == WAIT_OBJECT_0;
+    return DlssdFenceWait::Complete(gWaitFence, value, gWaitEvent, timeoutMs);
 }
 
 void OwnerLoop()
@@ -760,7 +757,13 @@ void OwnerLoop()
             std::unique_lock lock(gJobMutex);
             gJobCv.wait(lock, [] { return gShutdown || gHaveJob; });
             if (gShutdown && !gHaveJob)
+            {
+                // NGX/CUDA teardown belongs to the context owner, just like
+                // Init/Create/Evaluate. Never hold the job mutex during drain.
+                lock.unlock();
+                DlssdTranslatedSession::Release();
                 return;
+            }
             job = std::move(gJob);
             gHaveJob = false;
             gOwnerBusy.store(true, std::memory_order_release);

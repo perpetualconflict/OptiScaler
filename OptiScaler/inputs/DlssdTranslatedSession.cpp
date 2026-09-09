@@ -443,10 +443,21 @@ void AbandonHungCreate()
         logger->flush();
 }
 
-void ReleasePreparedRuntimeLocked()
+bool ReleasePreparedRuntimeLocked()
 {
-    if (gRelease != nullptr)
-        gRelease();
+    if (gRelease != nullptr && gRelease() != 0)
+    {
+        // A failed drain is not cancellation. Keep every companion loaded and
+        // prevent reattach over the runtime's retained objects. No automatic
+        // late-release retry: cleanup may already have retired some objects.
+        gAbandoned.store(true, std::memory_order_release);
+        gAbandonedPrepared.store(false, std::memory_order_release);
+        gCreateFailed.store(true, std::memory_order_release);
+        gAttached.store(false, std::memory_order_release);
+        gPrepared.store(false, std::memory_order_release);
+        LOG_WARN("DLSS-D runtime release failed; retaining sidecar modules and disabling reattach");
+        return false;
+    }
     if (gCallerShim != nullptr)
     {
         FreeLibrary(gCallerShim);
@@ -462,6 +473,7 @@ void ReleasePreparedRuntimeLocked()
     gAttachedRenderHeight = 0;
     gAttachedOutputWidth = 0;
     gAttachedOutputHeight = 0;
+    return true;
 }
 
 bool StartFinishAttach(const char** error)
@@ -669,7 +681,8 @@ void Release()
         gAttachedOutputWidth = 0;
         gAttachedOutputHeight = 0;
     }
-    gCreateFailed.store(false, std::memory_order_release);
+    if (!gAbandoned.load(std::memory_order_acquire))
+        gCreateFailed.store(false, std::memory_order_release);
 }
 
 bool ReleaseAbandonedLate()
@@ -684,7 +697,8 @@ bool ReleaseAbandonedLate()
     LOG_INFO("DLSS-D experimental backend late-releasing abandoned sidecar after the hung owner returned");
     if (auto logger = spdlog::default_logger())
         logger->flush();
-    ReleasePreparedRuntimeLocked();
+    if (!ReleasePreparedRuntimeLocked())
+        return false;
     gAttachedRenderWidth = 0;
     gAttachedRenderHeight = 0;
     gAttachedOutputWidth = 0;
