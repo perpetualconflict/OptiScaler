@@ -194,7 +194,6 @@ OwnerJob gJob;
 OwnerJob gPending;
 bool gHavePending = false;
 bool gReleaseAfterOwner = false;
-bool gLoggedBusyDefer = false;
 ID3D12Fence* gWaitFence = nullptr;
 HANDLE gWaitEvent = nullptr;
 UINT64 gWaitValue = 0;
@@ -965,26 +964,6 @@ bool QueueFinishAttach(uint32_t handleId)
     return true;
 }
 
-bool QueueUnpublishedEvaluate(uint32_t handleId, const InputSnapshot& snapshot, const AcceptedExtent* extent,
-                              ID3D12CommandQueue* queue)
-{
-    if (!DlssdTranslatedSession::IsAttached())
-        return false;
-    EnsureOwner();
-    std::lock_guard lock(gJobMutex);
-    if (gShutdown || gHaveJob || gOwnerBusy.load(std::memory_order_acquire))
-        return false;
-    gJob = {};
-    gJob.op = OwnerOp::Evaluate;
-    gJob.snapshot = snapshot;
-    AddRefJob(gJob, queue);
-    gJob.handleId = handleId;
-    gJob.extent = extent;
-    gHaveJob = true;
-    gJobCv.notify_one();
-    return true;
-}
-
 bool AbortHungCreateIfTimedOut(uint32_t handleId, const AcceptedExtent* extent)
 {
     if (!DlssdTranslatedSession::IsCreating())
@@ -1158,10 +1137,20 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
         return SkipUnsafe(handleId, "post_attach_quiesce", IdleSinceLastBoundaryMs(), snapshot.reset, extent,
                           quiesceMs);
 
+    // One staging set is shared with the owner. Reserve it before recording
+    // any GPU copy: the session try-lock alone does not protect a pending job
+    // whose caller list has not been submitted yet. Never replace that job.
+    std::unique_lock stagingLock(gJobMutex);
+    if (gShutdown || gHavePending || gHaveJob || gOwnerBusy.load(std::memory_order_acquire))
+    {
+        stagingLock.unlock();
+        return SkipUnsafe(handleId, "staging_in_use", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
+    }
     const char* copyError = nullptr;
     if (!DlssdTranslatedSession::Evaluate(commandList, snapshot, nullptr, false, &copyError,
                                           DlssdRuntimeFrame_CopyOnCallerList))
     {
+        stagingLock.unlock();
         if (copyError != nullptr && std::strcmp(copyError, "translated runtime is busy") == 0)
             return SkipUnsafe(handleId, "runtime_busy", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
         DlssdTranslatedSession::Release();
@@ -1176,9 +1165,6 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     }
 
     {
-        std::lock_guard lock(gJobMutex);
-        if (gHavePending)
-            ReleaseJob(gPending);
         gPending = {};
         gPending.op = OwnerOp::Evaluate;
         gPending.snapshot = snapshot;
@@ -1187,6 +1173,7 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
         gPending.extent = extent;
         gHavePending = true;
     }
+    stagingLock.unlock();
 
     gLastDispatchAt = Clock::now();
     gHaveLastDispatch = true;
@@ -1445,44 +1432,19 @@ void NotifyFrameSubmitted()
         }
         return;
     }
-    OwnerJob pending;
-    {
-        std::lock_guard lock(gJobMutex);
-        if (!gHavePending || gShutdown)
-            return;
-        if (gHaveJob || gOwnerBusy.load(std::memory_order_acquire))
-        {
-            if (!gLoggedBusyDefer)
-            {
-                gLoggedBusyDefer = true;
-                LOG_INFO("DLSS-D experimental backend kept unpublished HIP pending because the owner is busy");
-                FlushExperimentalLog();
-            }
-            return;
-        }
-        pending = std::move(gPending);
-        gHavePending = false;
-    }
-    if (!QueueUnpublishedEvaluate(pending.handleId, pending.snapshot, pending.extent, pending.queue))
-    {
-        std::lock_guard lock(gJobMutex);
-        if (!gHavePending && !gShutdown)
-        {
-            gPending = std::move(pending);
-            gHavePending = true;
-            if (!gLoggedBusyDefer)
-            {
-                gLoggedBusyDefer = true;
-                LOG_WARN("DLSS-D experimental backend requeued unpublished HIP after a busy owner");
-                FlushExperimentalLog();
-            }
-        }
-        else
-            ReleaseJob(pending);
+    // Transfer the single staging reservation atomically. Clearing pending
+    // before queueing the owner would allow the next NGX evaluate to overwrite
+    // staging in the gap, even though the session mutex is otherwise correct.
+    std::lock_guard lock(gJobMutex);
+    if (!gHavePending || gShutdown)
         return;
-    }
-    gLoggedBusyDefer = false;
-    ReleaseJob(pending);
+    if (gHaveJob || gOwnerBusy.load(std::memory_order_acquire))
+        return;
+    gJob = std::move(gPending);
+    gPending = {};
+    gHavePending = false;
+    gHaveJob = true;
+    gJobCv.notify_one();
 }
 
 void Release(uint32_t handleId)
