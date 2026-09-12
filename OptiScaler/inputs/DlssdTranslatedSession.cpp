@@ -40,6 +40,10 @@ PFN_DlssdRuntime_Evaluate gEvaluate = nullptr;
 PFN_DlssdRuntime_Release gRelease = nullptr;
 PFN_DlssdRuntime_LastError gLastError = nullptr;
 PFN_DlssdRuntime_SetLog gSetLog = nullptr;
+PFN_DlssdRuntime_BeginFrameLease gBeginFrameLease = nullptr;
+PFN_DlssdRuntime_VerifyFrameInput gVerifyFrameInput = nullptr;
+PFN_DlssdRuntime_GetReadyOutput gGetReadyOutput = nullptr;
+PFN_DlssdRuntime_EndFrameLease gEndFrameLease = nullptr;
 std::atomic<bool> gAttached { false };
 std::atomic<bool> gPrepared { false };
 std::atomic<bool> gCreating { false };
@@ -141,8 +145,17 @@ bool LoadRuntime(const char** error)
     gRelease = reinterpret_cast<PFN_DlssdRuntime_Release>(GetProcAddress(gModule, "DlssdRuntime_Release"));
     gLastError = reinterpret_cast<PFN_DlssdRuntime_LastError>(GetProcAddress(gModule, "DlssdRuntime_LastError"));
     gSetLog = reinterpret_cast<PFN_DlssdRuntime_SetLog>(GetProcAddress(gModule, "DlssdRuntime_SetLog"));
+    gBeginFrameLease = reinterpret_cast<PFN_DlssdRuntime_BeginFrameLease>(
+        GetProcAddress(gModule, "DlssdRuntime_BeginFrameLease"));
+    gVerifyFrameInput = reinterpret_cast<PFN_DlssdRuntime_VerifyFrameInput>(
+        GetProcAddress(gModule, "DlssdRuntime_VerifyFrameInput"));
+    gGetReadyOutput = reinterpret_cast<PFN_DlssdRuntime_GetReadyOutput>(
+        GetProcAddress(gModule, "DlssdRuntime_GetReadyOutput"));
+    gEndFrameLease = reinterpret_cast<PFN_DlssdRuntime_EndFrameLease>(
+        GetProcAddress(gModule, "DlssdRuntime_EndFrameLease"));
     if (gAttach == nullptr || gPrepareAttach == nullptr || gFinishAttach == nullptr || gEvaluate == nullptr ||
-        gRelease == nullptr)
+        gRelease == nullptr || gBeginFrameLease == nullptr || gVerifyFrameInput == nullptr ||
+        gGetReadyOutput == nullptr || gEndFrameLease == nullptr)
     {
         if (error)
         {
@@ -154,8 +167,16 @@ bool LoadRuntime(const char** error)
                 *error = "dlssd_translated_runtime.dll is missing DlssdRuntime_FinishAttach";
             else if (gEvaluate == nullptr)
                 *error = "dlssd_translated_runtime.dll is missing DlssdRuntime_Evaluate";
-            else
+            else if (gRelease == nullptr)
                 *error = "dlssd_translated_runtime.dll is missing DlssdRuntime_Release";
+            else if (gBeginFrameLease == nullptr)
+                *error = "dlssd_translated_runtime.dll is missing DlssdRuntime_BeginFrameLease";
+            else if (gVerifyFrameInput == nullptr)
+                *error = "dlssd_translated_runtime.dll is missing DlssdRuntime_VerifyFrameInput";
+            else if (gGetReadyOutput == nullptr)
+                *error = "dlssd_translated_runtime.dll is missing DlssdRuntime_GetReadyOutput";
+            else
+                *error = "dlssd_translated_runtime.dll is missing DlssdRuntime_EndFrameLease";
         }
         FreeLibrary(gModule);
         gModule = nullptr;
@@ -166,6 +187,11 @@ bool LoadRuntime(const char** error)
         gEvaluate = nullptr;
         gRelease = nullptr;
         gLastError = nullptr;
+        gSetLog = nullptr;
+        gBeginFrameLease = nullptr;
+        gVerifyFrameInput = nullptr;
+        gGetReadyOutput = nullptr;
+        gEndFrameLease = nullptr;
         return false;
     }
     gDataPath = (home / L"data").wstring();
@@ -705,6 +731,134 @@ bool ReleaseAbandonedLate()
     gAttachedOutputWidth = 0;
     gAttachedOutputHeight = 0;
     LOG_WARN("DLSS-D experimental backend released abandoned sidecar late; path stays poisoned");
+    return true;
+}
+
+bool BeginFrameLease(const DlssdFrameTag& tag, const char** error)
+{
+    if (error)
+        *error = nullptr;
+    std::unique_lock lock(gLock, std::defer_lock);
+    if (!lock.try_lock())
+    {
+        if (error)
+            *error = "translated runtime is busy";
+        return false;
+    }
+    if (gAbandoned.load(std::memory_order_acquire))
+    {
+        if (error)
+            *error = "translated runtime is abandoned";
+        return false;
+    }
+    if (!gAttached.load(std::memory_order_acquire) || gBeginFrameLease == nullptr)
+    {
+        if (error)
+            *error = "translated runtime is unavailable";
+        return false;
+    }
+    if (gBeginFrameLease(&tag) != 0)
+    {
+        if (error)
+            *error = RuntimeError();
+        return false;
+    }
+    return true;
+}
+
+bool VerifyFrameInput(const DlssdFrameTag& tag, const char** error)
+{
+    if (error)
+        *error = nullptr;
+    std::unique_lock lock(gLock, std::defer_lock);
+    if (!lock.try_lock())
+    {
+        if (error)
+            *error = "translated runtime is busy";
+        return false;
+    }
+    if (gAbandoned.load(std::memory_order_acquire))
+    {
+        if (error)
+            *error = "translated runtime is abandoned";
+        return false;
+    }
+    if (!gAttached.load(std::memory_order_acquire) || gVerifyFrameInput == nullptr)
+    {
+        if (error)
+            *error = "translated runtime is unavailable";
+        return false;
+    }
+    if (gVerifyFrameInput(&tag) != 0)
+    {
+        if (error)
+            *error = RuntimeError();
+        return false;
+    }
+    return true;
+}
+
+bool GetReadyOutput(DlssdReadyOutput& output, const char** error)
+{
+    if (error)
+        *error = nullptr;
+    std::unique_lock lock(gLock, std::defer_lock);
+    if (!lock.try_lock())
+    {
+        if (error)
+            *error = "translated runtime is busy";
+        return false;
+    }
+    if (gAbandoned.load(std::memory_order_acquire))
+    {
+        if (error)
+            *error = "translated runtime is abandoned";
+        return false;
+    }
+    if (!gAttached.load(std::memory_order_acquire) || gGetReadyOutput == nullptr)
+    {
+        if (error)
+            *error = "translated runtime is unavailable";
+        return false;
+    }
+    if (gGetReadyOutput(&output) != 0)
+    {
+        if (error)
+            *error = RuntimeError();
+        return false;
+    }
+    return true;
+}
+
+bool EndFrameLease(uint64_t receiptId, uint32_t retirement, const char** error)
+{
+    if (error)
+        *error = nullptr;
+    std::unique_lock lock(gLock, std::defer_lock);
+    if (!lock.try_lock())
+    {
+        if (error)
+            *error = "translated runtime is busy";
+        return false;
+    }
+    if (gAbandoned.load(std::memory_order_acquire))
+    {
+        if (error)
+            *error = "translated runtime is abandoned";
+        return false;
+    }
+    if (!gAttached.load(std::memory_order_acquire) || gEndFrameLease == nullptr)
+    {
+        if (error)
+            *error = "translated runtime is unavailable";
+        return false;
+    }
+    if (gEndFrameLease(receiptId, retirement) != 0)
+    {
+        if (error)
+            *error = RuntimeError();
+        return false;
+    }
     return true;
 }
 

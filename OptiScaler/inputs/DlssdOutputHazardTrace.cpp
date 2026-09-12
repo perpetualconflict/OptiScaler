@@ -1,7 +1,11 @@
 #include "pch.h"
 
+#include "DlssdExperimentalBackend.h"
 #include "DlssdOutputHazardTrace.h"
 #include "DlssdQueueRendezvous.h"
+
+#include "../../native/dlssd_publication_plan.h"
+#include "../../native/dlssd_submission_gate.h"
 
 #include <Config.h>
 #include <State.h>
@@ -133,6 +137,8 @@ struct HandleState
     uint32_t laterSubmissionConsumers = 0;
     uint32_t unresolvedEvents = 0;
     uint32_t closedEvalListsWithoutConsumer = 0;
+    bool currentSameListConsumer = false;
+    bool currentUnresolved = false;
     ConsumerKind firstConsumerKind = ConsumerKind::None;
     uint32_t firstConsumerEval = 0;
     uint64_t firstConsumerSubmit = 0;
@@ -141,7 +147,15 @@ struct HandleState
     uintptr_t firstMatchingList = 0;
     uint64_t firstMatchingSubmit = 0;
     uintptr_t lastSeenEvalList = 0;
-    std::vector<std::pair<ID3D12GraphicsCommandList*, std::string>> pendingOtherListUses;
+    struct PendingUse
+    {
+        ID3D12GraphicsCommandList* commandList = nullptr;
+        std::string event;
+        uint32_t stateBefore = 0;
+        bool hasStateBefore = false;
+        bool fullUnsplitTransition = false;
+    };
+    std::vector<PendingUse> pendingOtherListUses;
 };
 
 struct HeapSpan
@@ -167,6 +181,18 @@ struct TrackedDescriptor
 };
 
 using PFN_ExecuteCommandLists = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
+using PFN_UpdateTileMappings = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Resource*, UINT,
+                                                       const D3D12_TILED_RESOURCE_COORDINATE*,
+                                                       const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT,
+                                                       const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*,
+                                                       D3D12_TILE_MAPPING_FLAGS);
+using PFN_CopyTileMappings = void(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Resource*,
+                                                      const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*,
+                                                      const D3D12_TILED_RESOURCE_COORDINATE*,
+                                                      const D3D12_TILE_REGION_SIZE*,
+                                                      D3D12_TILE_MAPPING_FLAGS);
+using PFN_Signal = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+using PFN_Wait = HRESULT(STDMETHODCALLTYPE*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
 using PFN_ResourceBarrier = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
 using PFN_CopyResource = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12Resource*, ID3D12Resource*);
 using PFN_CopyTextureRegion = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, const D3D12_TEXTURE_COPY_LOCATION*,
@@ -183,6 +209,8 @@ using PFN_ExecuteIndirect = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*,
                                                      ID3D12Resource*, UINT64, ID3D12Resource*, UINT64);
 using PFN_ExecuteBundle = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12GraphicsCommandList*);
 using PFN_Close = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*);
+using PFN_Reset = HRESULT(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, ID3D12CommandAllocator*,
+                                              ID3D12PipelineState*);
 using PFN_SetComputeRootDescriptorTable = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT,
                                                                    D3D12_GPU_DESCRIPTOR_HANDLE);
 using PFN_SetGraphicsRootDescriptorTable = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT,
@@ -214,14 +242,22 @@ std::vector<HeapSpan> Heaps;
 std::unordered_map<uint64_t, TrackedDescriptor> CpuDescriptors;
 std::unordered_map<uint64_t, TrackedDescriptor> GpuDescriptors;
 std::unordered_map<ID3D12GraphicsCommandList*, PendingBind> PendingBinds;
+DlssdSubmissionGate::Registry SubmissionGates;
 std::atomic<uint64_t> SubmissionSeq { 0 };
-bool HooksInstalled = false;
+std::atomic<bool> HooksInstalled = false;
 bool HookInstallFailed = false;
 bool LoggedEnable = false;
 bool LoggedDisclaimer = false;
 bool DescriptorMapCapped = false;
+std::atomic<bool> QueueTimelineHooksReady = false;
+std::atomic<bool> ResetHookReady = false;
+std::atomic<bool> ObservationHooksReady = false;
 
 PFN_ExecuteCommandLists o_ExecuteCommandLists = nullptr;
+PFN_UpdateTileMappings o_UpdateTileMappings = nullptr;
+PFN_CopyTileMappings o_CopyTileMappings = nullptr;
+PFN_Signal o_Signal = nullptr;
+PFN_Wait o_Wait = nullptr;
 PFN_ResourceBarrier o_ResourceBarrier = nullptr;
 PFN_CopyResource o_CopyResource = nullptr;
 PFN_CopyTextureRegion o_CopyTextureRegion = nullptr;
@@ -233,6 +269,7 @@ PFN_DrawIndexedInstanced o_DrawIndexedInstanced = nullptr;
 PFN_ExecuteIndirect o_ExecuteIndirect = nullptr;
 PFN_ExecuteBundle o_ExecuteBundle = nullptr;
 PFN_Close o_Close = nullptr;
+PFN_Reset o_Reset = nullptr;
 PFN_SetComputeRootDescriptorTable o_SetComputeRootDescriptorTable = nullptr;
 PFN_SetGraphicsRootDescriptorTable o_SetGraphicsRootDescriptorTable = nullptr;
 PFN_SetComputeRootView o_SetComputeRootSRV = nullptr;
@@ -354,7 +391,8 @@ bool ShouldLogConsumerLocked(HandleState& handle, ConsumerKind kind)
 }
 
 void RecordResolvedUseLocked(HandleState& handle, uint32_t handleId, ID3D12GraphicsCommandList* commandList,
-                             const char* eventName, const char* detail)
+                             const char* eventName, const char* detail, uint32_t stateBefore = 0,
+                             bool hasStateBefore = false, bool fullUnsplitTransition = false)
 {
     const ConsumerKind kind = KindFromPhaseLocked(handle, commandList);
     if (kind == ConsumerKind::None)
@@ -365,9 +403,14 @@ void RecordResolvedUseLocked(HandleState& handle, uint32_t handleId, ID3D12Graph
         // Bound the deferred list: an unsubmitted list may never arrive, and
         // its address can be recycled by the game in the meantime.
         constexpr size_t kMaxPendingOtherListUses = 64;
-        while (handle.pendingOtherListUses.size() >= kMaxPendingOtherListUses)
-            handle.pendingOtherListUses.erase(handle.pendingOtherListUses.begin());
-        handle.pendingOtherListUses.emplace_back(commandList, eventName);
+        if (handle.pendingOtherListUses.size() >= kMaxPendingOtherListUses)
+        {
+            handle.currentUnresolved = true;
+            handle.unresolvedEvents++;
+            return;
+        }
+        handle.pendingOtherListUses.push_back(
+            { commandList, eventName, stateBefore, hasStateBefore, fullUnsplitTransition });
         if (handle.laterLogs < kMaxDetailLogs)
         {
             handle.laterLogs++;
@@ -376,6 +419,9 @@ void RecordResolvedUseLocked(HandleState& handle, uint32_t handleId, ID3D12Graph
         }
         return;
     }
+
+    if (kind == ConsumerKind::SameList)
+        handle.currentSameListConsumer = true;
 
     CountConsumerLocked(handle, kind);
     NoteFirstConsumerLocked(handle, kind, commandList, eventName);
@@ -390,6 +436,9 @@ void RecordResolvedUseLocked(HandleState& handle, uint32_t handleId, ID3D12Graph
 void RecordUnresolvedLocked(HandleState& handle, uint32_t handleId, ID3D12GraphicsCommandList* commandList,
                             const char* eventName)
 {
+    const auto kind = KindFromPhaseLocked(handle, commandList);
+    if (kind != ConsumerKind::None)
+        handle.currentUnresolved = true;
     handle.unresolvedEvents++;
     if (handle.unresolvedLogs >= kMaxDetailLogs)
         return;
@@ -514,6 +563,8 @@ void BeginEvaluateLocked(uint32_t handleId, NVSDK_NGX_Feature featureId, ID3D12G
     handle.phase = Phase::InEvaluate;
     handle.output = output;
     handle.outputGpuVa = 0;
+    handle.currentSameListConsumer = false;
+    handle.currentUnresolved = false;
     handle.pendingOtherListUses.clear();
     // The game recycles command-list addresses. A bind tracked under this
     // address from a destroyed list must not leak into the new recording.
@@ -544,6 +595,68 @@ void EndEvaluateLocked(uint32_t handleId, ID3D12GraphicsCommandList* commandList
     auto& handle = it->second;
     if (handle.phase == Phase::InEvaluate && handle.evalList == commandList)
         handle.phase = Phase::AfterEvaluateUnsubmitted;
+}
+
+void CapturePublicationPlanLocked(ID3D12CommandQueue* queue, UINT numLists, ID3D12CommandList* const* lists,
+                                  PublicationPlan& plan)
+{
+    plan = {};
+    if (!QueueTimelineHooksReady || !ObservationHooksReady || queue == nullptr || lists == nullptr || numLists == 0 ||
+        numLists > DlssdPublicationPlan::kMaxCommandLists)
+        return;
+
+    const D3D12_COMMAND_QUEUE_DESC desc = queue->GetDesc();
+    if (desc.Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return;
+
+    std::array<std::uintptr_t, DlssdPublicationPlan::kMaxCommandLists> listIdentities {};
+    for (UINT i = 0; i < numLists; ++i)
+        listIdentities[i] = reinterpret_cast<std::uintptr_t>(lists[i]);
+    const std::span<const std::uintptr_t> listSpan(listIdentities.data(), numLists);
+
+    bool sawCandidate = false;
+    bool sawInvalidCandidate = false;
+    PublicationPlan candidate {};
+    for (auto& [handleId, handle] : Handles)
+    {
+        if (handle.featureId != NVSDK_NGX_Feature_RayReconstruction ||
+            handle.phase != Phase::AfterEvaluateUnsubmitted || handle.evalList == nullptr)
+            continue;
+
+        sawCandidate = true;
+        std::vector<DlssdPublicationPlan::PendingUse> uses;
+        uses.reserve(handle.pendingOtherListUses.size());
+        for (const auto& use : handle.pendingOtherListUses)
+        {
+            uses.push_back({ reinterpret_cast<std::uintptr_t>(use.commandList), use.stateBefore,
+                             use.event == "barrier_to_read", use.hasStateBefore, use.fullUnsplitTransition });
+        }
+
+        DlssdPublicationPlan::Selection selection {};
+        const DlssdPublicationPlan::HandleInput input {
+            reinterpret_cast<std::uintptr_t>(handle.evalList), reinterpret_cast<std::uintptr_t>(handle.output),
+            handle.currentSameListConsumer, handle.currentUnresolved, std::span<const DlssdPublicationPlan::PendingUse>(uses) };
+        if (!DlssdPublicationPlan::SelectSingleHandleSuffix(listSpan, input, selection))
+        {
+            sawInvalidCandidate = true;
+            continue;
+        }
+
+        if (candidate.valid)
+        {
+            sawInvalidCandidate = true;
+            continue;
+        }
+        candidate.handleId = handleId;
+        candidate.producer = handle.evalList;
+        candidate.output = handle.output;
+        candidate.producerIndex = selection.producerIndex;
+        candidate.outputStateBefore = selection.outputStateBefore;
+        candidate.valid = true;
+    }
+
+    if (sawCandidate && !sawInvalidCandidate && candidate.valid)
+        plan = candidate;
 }
 
 void ObserveExecuteLocked(ID3D12CommandQueue* queue, UINT numLists, ID3D12CommandList* const* lists)
@@ -610,7 +723,7 @@ void ObserveExecuteLocked(ID3D12CommandQueue* queue, UINT numLists, ID3D12Comman
             bool inThisSubmit = false;
             for (UINT i = 0; i < numLists; ++i)
             {
-                if (lists[i] == pending->first)
+                if (lists[i] == pending->commandList)
                 {
                     inThisSubmit = true;
                     break;
@@ -630,12 +743,12 @@ void ObserveExecuteLocked(ID3D12CommandQueue* queue, UINT numLists, ID3D12Comman
             }
 
             CountConsumerLocked(handle, resolved);
-            NoteFirstConsumerLocked(handle, resolved, pending->first, pending->second.c_str());
+            NoteFirstConsumerLocked(handle, resolved, pending->commandList, pending->event.c_str());
             if (ShouldLogConsumerLocked(handle, resolved))
             {
                 LOG_INFO("DLSS-D output-order consume handle={} eval={} kind={} cmdList=0x{:X} event={} submit={}",
                          handleId, handle.lastEvalSeq, ConsumerKindName(resolved),
-                         reinterpret_cast<uintptr_t>(pending->first), pending->second, seq);
+                         reinterpret_cast<uintptr_t>(pending->commandList), pending->event, seq);
             }
             pending = handle.pendingOtherListUses.erase(pending);
         }
@@ -659,6 +772,19 @@ void ObserveBarrierLocked(ID3D12GraphicsCommandList* commandList, UINT numBarrie
             eventName = IsReadLikeState(barrier.Transition.StateAfter) ? "barrier_to_read" : "barrier_to_write";
             detail = std::format("before=0x{:X} after=0x{:X}", static_cast<unsigned>(barrier.Transition.StateBefore),
                                  static_cast<unsigned>(barrier.Transition.StateAfter));
+            HandleState* handle = FindHandleByOutputLocked(resource);
+            if (handle != nullptr)
+            {
+                const auto outputDesc = handle->output->GetDesc();
+                const bool singleSubresource = outputDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                                               outputDesc.MipLevels == 1 && outputDesc.DepthOrArraySize == 1;
+                const bool fullUnsplit = barrier.Flags == D3D12_RESOURCE_BARRIER_FLAG_NONE &&
+                                         (barrier.Transition.Subresource == D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES ||
+                                          (singleSubresource && barrier.Transition.Subresource == 0));
+                RecordResolvedUseLocked(*handle, HandleIdOf(handle), commandList, eventName, detail.c_str(),
+                                        static_cast<uint32_t>(barrier.Transition.StateBefore), true, fullUnsplit);
+                continue;
+            }
         }
         else if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING)
         {
@@ -762,8 +888,88 @@ void ObserveCloseLocked(ID3D12GraphicsCommandList* commandList)
     }
 }
 
+void InvalidateCommandListLocked(ID3D12GraphicsCommandList* commandList)
+{
+    PendingBinds.erase(commandList);
+    for (auto& [handleId, handle] : Handles)
+    {
+        if (handle.evalList == commandList)
+        {
+            handle.evalList = nullptr;
+            handle.output = nullptr;
+            handle.outputGpuVa = 0;
+            handle.phase = Phase::Idle;
+            handle.pendingOtherListUses.clear();
+            handle.currentSameListConsumer = false;
+            handle.currentUnresolved = false;
+        }
+        else
+        {
+            for (auto pending = handle.pendingOtherListUses.begin(); pending != handle.pendingOtherListUses.end();)
+            {
+                if (pending->commandList == commandList)
+                    pending = handle.pendingOtherListUses.erase(pending);
+                else
+                    ++pending;
+            }
+        }
+    }
+}
+
+void hkUpdateTileMappings(ID3D12CommandQueue* This, ID3D12Resource* pResource, UINT NumResourceRegions,
+                          const D3D12_TILED_RESOURCE_COORDINATE* pResourceRegionStartCoordinates,
+                          const D3D12_TILE_REGION_SIZE* pResourceRegionSizes, ID3D12Heap* pHeap, UINT NumRanges,
+                          const D3D12_TILE_RANGE_FLAGS* pRangeFlags, const UINT* pHeapRangeStartOffsets,
+                          const UINT* pRangeTileCounts, D3D12_TILE_MAPPING_FLAGS Flags)
+{
+    const auto gate = SubmissionGates.Get(This);
+    std::unique_lock<std::recursive_mutex> gateLock;
+    if (gate != nullptr)
+        gateLock = std::unique_lock<std::recursive_mutex>(*gate);
+    o_UpdateTileMappings(This, pResource, NumResourceRegions, pResourceRegionStartCoordinates, pResourceRegionSizes,
+                         pHeap, NumRanges, pRangeFlags, pHeapRangeStartOffsets, pRangeTileCounts, Flags);
+}
+
+void hkCopyTileMappings(ID3D12CommandQueue* This, ID3D12Resource* pDstResource,
+                        const D3D12_TILED_RESOURCE_COORDINATE* pDstRegionStartCoordinate,
+                        ID3D12Resource* pSrcResource,
+                        const D3D12_TILED_RESOURCE_COORDINATE* pSrcRegionStartCoordinate,
+                        const D3D12_TILE_REGION_SIZE* pRegionSize,
+                        D3D12_TILE_MAPPING_FLAGS Flags)
+{
+    const auto gate = SubmissionGates.Get(This);
+    std::unique_lock<std::recursive_mutex> gateLock;
+    if (gate != nullptr)
+        gateLock = std::unique_lock<std::recursive_mutex>(*gate);
+    o_CopyTileMappings(This, pDstResource, pDstRegionStartCoordinate, pSrcResource, pSrcRegionStartCoordinate,
+                       pRegionSize, Flags);
+}
+
+HRESULT hkSignal(ID3D12CommandQueue* This, ID3D12Fence* pFence, UINT64 Value)
+{
+    const auto gate = SubmissionGates.Get(This);
+    std::unique_lock<std::recursive_mutex> gateLock;
+    if (gate != nullptr)
+        gateLock = std::unique_lock<std::recursive_mutex>(*gate);
+    return o_Signal(This, pFence, Value);
+}
+
+HRESULT hkWait(ID3D12CommandQueue* This, ID3D12Fence* pFence, UINT64 Value)
+{
+    const auto gate = SubmissionGates.Get(This);
+    std::unique_lock<std::recursive_mutex> gateLock;
+    if (gate != nullptr)
+        gateLock = std::unique_lock<std::recursive_mutex>(*gate);
+    return o_Wait(This, pFence, Value);
+}
+
 void hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists, ID3D12CommandList* const* ppCommandLists)
 {
+    const auto gate = SubmissionGates.Get(This);
+    std::unique_lock<std::recursive_mutex> gateLock;
+    if (gate != nullptr)
+        gateLock = std::unique_lock<std::recursive_mutex>(*gate);
+
     // The experimental rendezvous deliberately serializes only instrumented
     // queue submissions. Its HIP waiter must be enqueued immediately before the
     // matching D3D12 submission, with no other probe submission interleaved.
@@ -774,12 +980,29 @@ void hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists, ID3D1
 
     const uint64_t rendezvousToken = DlssdQueueRendezvous::BeforeExecuteCommandLists(
         This, NumCommandLists, ppCommandLists);
-    if (Enabled() && !State::Instance().isShuttingDown && ppCommandLists != nullptr && NumCommandLists > 0)
+    PublicationPlan plan {};
+    if (Enabled() && gate != nullptr && rendezvousToken == 0 && QueueTimelineHooksReady &&
+        !State::Instance().isShuttingDown &&
+        ppCommandLists != nullptr && NumCommandLists > 0)
+    {
+        std::lock_guard lock(StateMutex);
+        CapturePublicationPlanLocked(This, NumCommandLists, ppCommandLists, plan);
+        ObserveExecuteLocked(This, NumCommandLists, ppCommandLists);
+    }
+    else if (Enabled() && !State::Instance().isShuttingDown && ppCommandLists != nullptr && NumCommandLists > 0)
     {
         std::lock_guard lock(StateMutex);
         ObserveExecuteLocked(This, NumCommandLists, ppCommandLists);
     }
-    o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+
+    bool submitted = false;
+    if (gate != nullptr && !State::Instance().isShuttingDown)
+        submitted = DlssdExperimentalBackend::ExecuteMatchingSubmission(This, NumCommandLists, ppCommandLists,
+                                                                        reinterpret_cast<DlssdExperimentalBackend::ExecuteLists>(
+                                                                            o_ExecuteCommandLists),
+                                                                        rendezvousToken == 0 ? plan : PublicationPlan {});
+    if (!submitted)
+        o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
     DlssdQueueRendezvous::AfterExecuteCommandLists(This, rendezvousToken);
 }
 
@@ -912,6 +1135,18 @@ HRESULT hkClose(ID3D12GraphicsCommandList* This)
         ObserveCloseLocked(This);
     }
     return o_Close(This);
+}
+
+HRESULT hkReset(ID3D12GraphicsCommandList* This, ID3D12CommandAllocator* allocator, ID3D12PipelineState* pipelineState)
+{
+    const HRESULT result = o_Reset(This, allocator, pipelineState);
+    if (SUCCEEDED(result))
+    {
+        DlssdExperimentalBackend::NotifyCommandListReset(This);
+        std::lock_guard lock(StateMutex);
+        InvalidateCommandListLocked(This);
+    }
+    return result;
 }
 
 void hkSetComputeRootDescriptorTable(ID3D12GraphicsCommandList* This, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE gpu)
@@ -1146,7 +1381,11 @@ void InstallHooksLocked(ID3D12Device* device)
     PVOID* listVTable = *reinterpret_cast<PVOID**>(commandList);
     PVOID* deviceVTable = *reinterpret_cast<PVOID**>(realDevice);
 
+    o_UpdateTileMappings = reinterpret_cast<PFN_UpdateTileMappings>(queueVTable[8]);
+    o_CopyTileMappings = reinterpret_cast<PFN_CopyTileMappings>(queueVTable[9]);
     o_ExecuteCommandLists = reinterpret_cast<PFN_ExecuteCommandLists>(queueVTable[10]);
+    o_Signal = reinterpret_cast<PFN_Signal>(queueVTable[14]);
+    o_Wait = reinterpret_cast<PFN_Wait>(queueVTable[15]);
     o_Close = reinterpret_cast<PFN_Close>(listVTable[9]);
     o_DrawInstanced = reinterpret_cast<PFN_DrawInstanced>(listVTable[12]);
     o_DrawIndexedInstanced = reinterpret_cast<PFN_DrawIndexedInstanced>(listVTable[13]);
@@ -1157,6 +1396,7 @@ void InstallHooksLocked(ID3D12Device* device)
     o_ResolveSubresource = reinterpret_cast<PFN_ResolveSubresource>(listVTable[19]);
     o_ResourceBarrier = reinterpret_cast<PFN_ResourceBarrier>(listVTable[26]);
     o_ExecuteBundle = reinterpret_cast<PFN_ExecuteBundle>(listVTable[27]);
+    o_Reset = reinterpret_cast<PFN_Reset>(listVTable[8]);
     o_SetComputeRootDescriptorTable = reinterpret_cast<PFN_SetComputeRootDescriptorTable>(listVTable[31]);
     o_SetGraphicsRootDescriptorTable = reinterpret_cast<PFN_SetGraphicsRootDescriptorTable>(listVTable[32]);
     o_SetComputeRootSRV = reinterpret_cast<PFN_SetComputeRootView>(listVTable[39]);
@@ -1182,33 +1422,49 @@ void InstallHooksLocked(ID3D12Device* device)
 
     DetourTransactionBegin();
     DetourUpdateThread(GetCurrentThread());
-    Attach(reinterpret_cast<PVOID*>(&o_ExecuteCommandLists), hkExecuteCommandLists);
+    const bool updateTileMappingsAttached = Attach(reinterpret_cast<PVOID*>(&o_UpdateTileMappings), hkUpdateTileMappings);
+    const bool copyTileMappingsAttached = Attach(reinterpret_cast<PVOID*>(&o_CopyTileMappings), hkCopyTileMappings);
+    const bool executeCommandListsAttached = Attach(reinterpret_cast<PVOID*>(&o_ExecuteCommandLists), hkExecuteCommandLists);
+    const bool signalAttached = Attach(reinterpret_cast<PVOID*>(&o_Signal), hkSignal);
+    const bool waitAttached = Attach(reinterpret_cast<PVOID*>(&o_Wait), hkWait);
+    bool resetAttached = false;
+    bool observationHooksReady = true;
+    const auto attachObservationHook = [&](PVOID* pointer, PVOID detour)
+    {
+        const bool attached = Attach(pointer, detour);
+        observationHooksReady = observationHooksReady && attached;
+    };
     if (Enabled())
     {
-        Attach(reinterpret_cast<PVOID*>(&o_ResourceBarrier), hkResourceBarrier);
-        Attach(reinterpret_cast<PVOID*>(&o_CopyResource), hkCopyResource);
-        Attach(reinterpret_cast<PVOID*>(&o_CopyTextureRegion), hkCopyTextureRegion);
-        Attach(reinterpret_cast<PVOID*>(&o_CopyBufferRegion), hkCopyBufferRegion);
-        Attach(reinterpret_cast<PVOID*>(&o_ResolveSubresource), hkResolveSubresource);
-        Attach(reinterpret_cast<PVOID*>(&o_Dispatch), hkDispatch);
-        Attach(reinterpret_cast<PVOID*>(&o_DrawInstanced), hkDrawInstanced);
-        Attach(reinterpret_cast<PVOID*>(&o_DrawIndexedInstanced), hkDrawIndexedInstanced);
-        Attach(reinterpret_cast<PVOID*>(&o_ExecuteIndirect), hkExecuteIndirect);
-        Attach(reinterpret_cast<PVOID*>(&o_ExecuteBundle), hkExecuteBundle);
-        Attach(reinterpret_cast<PVOID*>(&o_Close), hkClose);
-        Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootDescriptorTable), hkSetComputeRootDescriptorTable);
-        Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootDescriptorTable), hkSetGraphicsRootDescriptorTable);
-        Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootSRV), hkSetComputeRootSRV);
-        Attach(reinterpret_cast<PVOID*>(&o_SetComputeRootUAV), hkSetComputeRootUAV);
-        Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootSRV), hkSetGraphicsRootSRV);
-        Attach(reinterpret_cast<PVOID*>(&o_SetGraphicsRootUAV), hkSetGraphicsRootUAV);
-        Attach(reinterpret_cast<PVOID*>(&o_OMSetRenderTargets), hkOMSetRenderTargets);
-        Attach(reinterpret_cast<PVOID*>(&o_CreateDescriptorHeap), hkCreateDescriptorHeap);
-        Attach(reinterpret_cast<PVOID*>(&o_CreateShaderResourceView), hkCreateShaderResourceView);
-        Attach(reinterpret_cast<PVOID*>(&o_CreateUnorderedAccessView), hkCreateUnorderedAccessView);
-        Attach(reinterpret_cast<PVOID*>(&o_CreateRenderTargetView), hkCreateRenderTargetView);
-        Attach(reinterpret_cast<PVOID*>(&o_CopyDescriptors), hkCopyDescriptors);
-        Attach(reinterpret_cast<PVOID*>(&o_CopyDescriptorsSimple), hkCopyDescriptorsSimple);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_ResourceBarrier), hkResourceBarrier);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CopyResource), hkCopyResource);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CopyTextureRegion), hkCopyTextureRegion);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CopyBufferRegion), hkCopyBufferRegion);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_ResolveSubresource), hkResolveSubresource);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_Dispatch), hkDispatch);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_DrawInstanced), hkDrawInstanced);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_DrawIndexedInstanced), hkDrawIndexedInstanced);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_ExecuteIndirect), hkExecuteIndirect);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_ExecuteBundle), hkExecuteBundle);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_Close), hkClose);
+        resetAttached = Attach(reinterpret_cast<PVOID*>(&o_Reset), hkReset);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_SetComputeRootDescriptorTable), hkSetComputeRootDescriptorTable);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_SetGraphicsRootDescriptorTable), hkSetGraphicsRootDescriptorTable);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_SetComputeRootSRV), hkSetComputeRootSRV);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_SetComputeRootUAV), hkSetComputeRootUAV);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_SetGraphicsRootSRV), hkSetGraphicsRootSRV);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_SetGraphicsRootUAV), hkSetGraphicsRootUAV);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_OMSetRenderTargets), hkOMSetRenderTargets);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CreateDescriptorHeap), hkCreateDescriptorHeap);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CreateShaderResourceView), hkCreateShaderResourceView);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CreateUnorderedAccessView), hkCreateUnorderedAccessView);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CreateRenderTargetView), hkCreateRenderTargetView);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CopyDescriptors), hkCopyDescriptors);
+        attachObservationHook(reinterpret_cast<PVOID*>(&o_CopyDescriptorsSimple), hkCopyDescriptorsSimple);
+    }
+    else if (DlssdExperimentalBackend::Enabled())
+    {
+        resetAttached = Attach(reinterpret_cast<PVOID*>(&o_Reset), hkReset);
     }
 
     const LONG error = DetourTransactionCommit();
@@ -1219,6 +1475,14 @@ void InstallHooksLocked(ID3D12Device* device)
         return;
     }
 
+    QueueTimelineHooksReady = updateTileMappingsAttached && copyTileMappingsAttached &&
+                              executeCommandListsAttached && signalAttached && waitAttached &&
+                              (!Enabled() || !DlssdExperimentalBackend::Enabled() || resetAttached);
+    ResetHookReady = resetAttached;
+    ObservationHooksReady = observationHooksReady;
+    if (!QueueTimelineHooksReady)
+        LOG_WARN("DLSS-D output-order: publication disabled because queue timeline hooks are incomplete");
+
     HooksInstalled = true;
     LOG_INFO("DLSS-D diagnostics: installed ExecuteCommandLists hook (output-order={}, rendezvous={})", Enabled(),
              DlssdQueueRendezvous::Enabled());
@@ -1227,13 +1491,18 @@ void InstallHooksLocked(ID3D12Device* device)
 
 bool Enabled() { return Config::Instance()->FSRRTraceDlssdOutputOrdering.value_or_default(); }
 
+bool ReceiptsAvailable()
+{
+    return HooksInstalled && QueueTimelineHooksReady && ResetHookReady;
+}
+
 void InstallForDevice(ID3D12Device* device)
 {
     if (device == nullptr)
         return;
 
     DlssdQueueRendezvous::InstallForDevice(device);
-    if (!Enabled() && !DlssdQueueRendezvous::Enabled())
+    if (!Enabled() && !DlssdQueueRendezvous::Enabled() && !DlssdExperimentalBackend::Enabled())
         return;
 
     std::lock_guard lock(StateMutex);

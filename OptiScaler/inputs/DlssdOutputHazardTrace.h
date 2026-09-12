@@ -6,6 +6,7 @@
 
 struct ID3D12Device;
 struct ID3D12GraphicsCommandList;
+struct ID3D12Resource;
 struct NVSDK_NGX_Parameter;
 
 // Opt-in diagnostic for whether Cyberpunk (or another title) consumes the
@@ -14,7 +15,18 @@ struct NVSDK_NGX_Parameter;
 // Disabled by default. Does not enable the FG/Hudfix descriptor tracker.
 namespace DlssdOutputHazardTrace
 {
+struct PublicationPlan
+{
+    uint32_t handleId = 0;
+    ID3D12GraphicsCommandList* producer = nullptr;
+    struct ID3D12Resource* output = nullptr;
+    uint32_t producerIndex = 0;
+    uint32_t outputStateBefore = 0;
+    bool valid = false;
+};
+
 bool Enabled();
+bool ReceiptsAvailable();
 void InstallForDevice(ID3D12Device* device);
 void OnCreate(uint32_t handleId, NVSDK_NGX_Feature featureId, ID3D12GraphicsCommandList* commandList);
 void OnRelease(uint32_t handleId);

@@ -11,6 +11,8 @@
 #include <denoisers/RrInputRegistry.h>
 
 #include "../../native/dlssd_translated_runtime.h"
+#include "../../native/dlssd_frame_lease.h"
+#include "../../native/dlssd_input_receipt.h"
 
 #include <d3d12.h>
 #include <dxgi1_4.h>
@@ -23,6 +25,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -167,6 +170,36 @@ enum class OwnerOp
     Evaluate,
 };
 
+// One allocation set is shared by caller-list staging and the HIP owner.
+// Keep the complete lease, not merely resource pointers, until both APIs
+// finish and the recorded game list can no longer replay the staging copy.
+struct FrameLease
+{
+    DlssdFrameTag tag;
+    DlssdInputReceipt::Receipt input;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> producer;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> resources;
+    Microsoft::WRL::ComPtr<ID3D12Resource> output;
+    Microsoft::WRL::ComPtr<ID3D12Resource> ready;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> publicationList;
+    Microsoft::WRL::ComPtr<ID3D12Fence> publicationFence;
+    uint32_t outputX = 0, outputY = 0, width = 0, height = 0;
+    uint32_t readyState = 0;
+    bool copyFailed = false, ownerDone = false, ownerOk = false;
+    bool split = false, cancelled = false, published = false, publicationSignalled = false;
+    bool handoffActive = false;
+    bool publicationCounted = false;
+};
+// The single outstanding lease must survive proxy unload if GPU retirement
+// was never proven. Normal retirement resets it and frees all owned objects.
+auto& gFrameLease = *new std::shared_ptr<FrameLease>();
+std::atomic<ID3D12GraphicsCommandList*> gReceiptProducer { nullptr };
+uint64_t gNextReceipt = 0;
+uint64_t gPreviousOwnerFrame = 0;
+uint32_t gPreviousOwnerHandle = 0;
+std::atomic<long long> gLastMatchedSubmitEnd { 0 };
+
 struct OwnerJob
 {
     OwnerOp op = OwnerOp::Evaluate;
@@ -174,6 +207,7 @@ struct OwnerJob
     uint32_t handleId = 0;
     const AcceptedExtent* extent = nullptr;
     ID3D12CommandQueue* queue = nullptr;
+    std::shared_ptr<FrameLease> lease;
 };
 
 std::mutex gJobMutex;
@@ -189,7 +223,7 @@ std::atomic<bool> gOwnerBusy { false };
 // second owner that would compete for ZLUDA TLS and device hooks.
 std::atomic<bool> gOwnerHungLeaked { false };
 std::atomic<bool> gOwnerAlive { false };
-bool gShutdown = false;
+std::atomic<bool> gShutdown { false };
 OwnerJob gJob;
 OwnerJob gPending;
 bool gHavePending = false;
@@ -235,16 +269,16 @@ bool OwnerEvaluatesAllowed()
     return Config::Instance()->FSRRDlssdOwnerEvaluates.value_or_default();
 }
 
-void LogPublicationUnavailable()
+void LogPublicationContract()
 {
     if (!Config::Instance()->FSRRDlssdPresentTranslated.value_or_default())
         return;
     static std::once_flag logged;
     std::call_once(logged, []
                    {
-                       LOG_WARN("DLSS-D experimental backend publication unavailable: caller-list output handoff "
-                                "not implemented; DlssdPresentTranslated remains requested, owner evaluations "
-                                "stay unpublished and FSR-RR remains the presented output");
+                       LOG_WARN("DLSS-D experimental backend matching-frame publication requested: only a verified "
+                                "producer/suffix boundary may publish; unknown boundaries retain FSR-RR. "
+                                "The queue submission may wait for the translated owner result.");
                    });
 }
 
@@ -346,7 +380,9 @@ long long IdleSinceLastBoundaryMs()
 {
     if (!gHaveLastEvaluateExit)
         return 0;
-    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - gLastEvaluateExit).count();
+    const auto submitEnd = Clock::time_point(Clock::duration(gLastMatchedSubmitEnd.load(std::memory_order_acquire)));
+    return std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+        (std::max)(gLastEvaluateExit, submitEnd)).count();
 }
 
 void NoteEvaluateBoundary()
@@ -355,11 +391,73 @@ void NoteEvaluateBoundary()
     gHaveLastEvaluateExit = true;
 }
 
+// Caller holds gJobMutex. No GPU wait or blocking session lock is permitted.
+bool RetireFrameLeaseLocked()
+{
+    if (!gFrameLease)
+        return true;
+    auto& lease = *gFrameLease;
+    if (lease.handoffActive)
+        return false;
+    if (lease.published && lease.publicationSignalled && lease.publicationFence && !lease.publicationCounted)
+    {
+        const auto completed = lease.publicationFence->GetCompletedValue();
+        if (completed != UINT64_MAX && completed >= 1)
+        {
+            lease.publicationCounted = true;
+            gPublished.fetch_add(1);
+            LOG_INFO("DLSS-D frame receipt={} source_frame={} publication_complete=1",
+                     lease.tag.receiptId, lease.tag.sourceFrame);
+        }
+    }
+    if (lease.input.State() == DlssdInputReceipt::Receipt::Phase::Submitted)
+        lease.input.WaitAndVerify(0);
+    const bool cancelled = lease.input.State() == DlssdInputReceipt::Receipt::Phase::Cancelled;
+    if (!lease.input.CanRetire() || (!cancelled && !lease.ownerDone))
+        return false;
+    if (!cancelled && !lease.tag.inputSubmissionVerified)
+    {
+        auto verified = lease.tag;
+        verified.inputSubmissionVerified = 1;
+        const char* verifyError = nullptr;
+        if (!DlssdTranslatedSession::VerifyFrameInput(verified, &verifyError))
+            return false;
+        lease.tag = verified;
+    }
+    if (lease.published)
+    {
+        if (!lease.publicationSignalled || !lease.publicationFence)
+            return false;
+        const auto completed = lease.publicationFence->GetCompletedValue();
+        if (completed == UINT64_MAX || completed < 1)
+            return false;
+    }
+    const uint32_t retirement = (cancelled ? DlssdLease_InputCancelled : DlssdLease_InputCompleted) |
+        (lease.published ? DlssdLease_OutputCompleted : DlssdLease_OutputNotPublished);
+    const char* error = nullptr;
+    if (!DlssdTranslatedSession::EndFrameLease(lease.tag.receiptId, retirement, &error))
+        return false;
+    LOG_INFO("DLSS-D frame receipt={} source_frame={} retired=1 published={}",
+             lease.tag.receiptId, lease.tag.sourceFrame, lease.published ? 1 : 0);
+    gReceiptProducer.store(nullptr, std::memory_order_release);
+    gFrameLease.reset();
+    return true;
+}
+
 void DropTranslatedMappings()
 {
     bool releaseNow = true;
     {
         std::unique_lock lock(gJobMutex);
+        if (!RetireFrameLeaseLocked())
+        {
+            // A CPU timeout or feature reset cannot revoke recorded GPU work.
+            // Keep the runtime allocation set alive until its receipts retire.
+            if (gFrameLease)
+                gFrameLease->cancelled = true;
+            LOG_WARN("DLSS-D mapping drop deferred: unretired frame receipt");
+            return;
+        }
         if (gHavePending)
         {
             ReleaseJob(gPending);
@@ -699,35 +797,6 @@ void ReleaseWaitFence()
     gWaitValue = 0;
 }
 
-bool WaitGameQueue(ID3D12CommandQueue* queue, DWORD timeoutMs)
-{
-    if (queue == nullptr)
-        queue = State::Instance().currentCommandQueue;
-    if (queue == nullptr)
-        return false;
-    if (gWaitFence == nullptr)
-    {
-        ID3D12Device* device = nullptr;
-        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr)
-            return false;
-        const HRESULT fenceHr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gWaitFence));
-        device->Release();
-        if (FAILED(fenceHr) || gWaitFence == nullptr)
-            return false;
-        gWaitEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (gWaitEvent == nullptr)
-        {
-            gWaitFence->Release();
-            gWaitFence = nullptr;
-            return false;
-        }
-    }
-    const auto value = ++gWaitValue;
-    if (FAILED(queue->Signal(gWaitFence, value)))
-        return false;
-    return DlssdFenceWait::Complete(gWaitFence, value, gWaitEvent, timeoutMs);
-}
-
 void OwnerLoop()
 {
     // Narrow bypass: only the CUDA bind and the blocking NGX create/evaluate
@@ -759,6 +828,7 @@ void OwnerLoop()
             {
                 // NGX/CUDA teardown belongs to the context owner, just like
                 // Init/Create/Evaluate. Never hold the job mutex during drain.
+                RetireFrameLeaseLocked();
                 lock.unlock();
                 DlssdTranslatedSession::Release();
                 return;
@@ -800,27 +870,83 @@ void OwnerLoop()
         {
             const char* error = nullptr;
             const auto enter = Clock::now();
-            bool ok = WaitGameQueue(job.queue, 2000);
+            bool ok = false;
+            if (job.lease)
+            {
+                const auto deadline = Clock::now() + std::chrono::seconds(2);
+                do
+                {
+                    {
+                        std::lock_guard lock(gJobMutex);
+                        auto& lease = *job.lease;
+                        if (lease.input.State() == DlssdInputReceipt::Receipt::Phase::Submitted)
+                            lease.input.WaitAndVerify(0);
+                        ok = lease.input.State() == DlssdInputReceipt::Receipt::Phase::Complete;
+                        if (ok || lease.cancelled)
+                            break;
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                } while (Clock::now() < deadline);
+                if (ok)
+                {
+                    std::lock_guard lock(gJobMutex);
+                    auto verified = job.lease->tag;
+                    verified.inputSubmissionVerified = 1;
+                    ok = DlssdTranslatedSession::VerifyFrameInput(verified, &error);
+                    if (ok)
+                        job.lease->tag = verified;
+                    ok = ok && !job.lease->copyFailed && !job.lease->cancelled;
+                }
+            }
             const bool waitFailed = !ok;
             // The queue wait only orders earlier input copies. It does not
             // grant the owner exclusive access to a live game output or order
             // its consumers. Keep validated output private until a completion
             // handoff can record publication on the current NGX caller list.
             if (!ok)
-                error = "game queue wait failed before unpublished evaluate";
+            {
+                if (error == nullptr)
+                    error = "input receipt incomplete, cancelled or caller copy failed";
+            }
             else
             {
                 // Sparse owner samples are separated by many game frames.
                 // Their motion describes adjacent game frames, not the prior
                 // private sample. Reset only this diagnostic job's history.
                 const auto requestedReset = job.snapshot.reset;
-                job.snapshot.reset = 1;
+                const bool contiguous = job.lease && job.lease->split &&
+                    gPreviousOwnerHandle == job.handleId &&
+                    gPreviousOwnerFrame + 1 == job.snapshot.frameIndex;
+                job.snapshot.reset = contiguous ? requestedReset : 1;
                 LOG_INFO("DLSS-D experimental backend handle={} owner evaluate source_ngx_frame={} reset_requested={} reset_effective={} "
-                         "reason=sparse_owner_history",
+                         "reason=receipt_history_continuity",
                          job.handleId, job.snapshot.frameIndex, requestedReset, job.snapshot.reset);
                 FlushExperimentalLog();
                 ok = DlssdTranslatedSession::Evaluate(nullptr, job.snapshot, nullptr, false, &error,
                                                       DlssdRuntimeFrame_SkipInputCopy);
+                gPreviousOwnerFrame = ok ? job.snapshot.frameIndex : 0;
+                gPreviousOwnerHandle = ok ? job.handleId : 0;
+            }
+            if (job.lease)
+            {
+                std::lock_guard lock(gJobMutex);
+                auto& lease = *job.lease;
+                if (ok && lease.split && !lease.cancelled)
+                {
+                    DlssdReadyOutput ready;
+                    ready.receiptId = lease.tag.receiptId;
+                    ready.sourceFrame = lease.tag.sourceFrame;
+                    ready.handleId = lease.tag.handleId;
+                    ok = DlssdTranslatedSession::GetReadyOutput(ready, &error);
+                    if (ok)
+                    {
+                        lease.ready.Attach(static_cast<ID3D12Resource*>(ready.resource));
+                        lease.readyState = ready.state;
+                    }
+                }
+                lease.ownerOk = ok;
+                lease.ownerDone = true;
+                gJobCv.notify_all();
             }
             const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - enter).count();
             ReleaseJob(job);
@@ -839,7 +965,11 @@ void OwnerLoop()
             else if (!ok)
             {
                 NoteOwnerFailure(error);
-                DlssdTranslatedSession::Release();
+                // A failed leased evaluate still owns recorded GPU inputs.
+                // Retire on Reset/completion; final release remains guarded
+                // by the sidecar's active-lease check if proof never arrives.
+                if (!job.lease)
+                    DlssdTranslatedSession::Release();
                 gRuntimePoisoned.store(true, std::memory_order_relaxed);
                 gRejectedRuntime.fetch_add(1, std::memory_order_relaxed);
                 LOG_WARN("DLSS-D experimental backend handle={} owner evaluate failed after {} ms: {}", job.handleId,
@@ -913,10 +1043,10 @@ void StopOwner(bool abortIfCreating)
         }
         else
         {
-            gHaveJob = false;
-            gHavePending = false;
-            gOwnerBusy.store(false, std::memory_order_release);
+            // Do not mutate another thread's job ownership without its lock.
+            // Abandonment retains the runtime; the late owner sees shutdown.
             gShutdown = true;
+            gJobCv.notify_all();
         }
         const auto abandonElapsedMs = DlssdTranslatedSession::CreatingElapsedMs();
         DlssdTranslatedSession::AbandonHungCreate();
@@ -1144,27 +1274,68 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     // One staging set is shared with the owner. Reserve it before recording
     // any GPU copy: the session try-lock alone does not protect a pending job
     // whose caller list has not been submitted yet. Never replace that job.
+    if (!DlssdOutputHazardTrace::ReceiptsAvailable())
+        return SkipUnsafe(handleId, "receipt_hooks_unavailable", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
     std::unique_lock stagingLock(gJobMutex);
-    if (gShutdown || gHavePending || gHaveJob || gOwnerBusy.load(std::memory_order_acquire))
+    if (gShutdown || gHavePending || gHaveJob || gOwnerBusy.load(std::memory_order_acquire) ||
+        !RetireFrameLeaseLocked())
     {
         stagingLock.unlock();
         return SkipUnsafe(handleId, "staging_in_use", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
     }
+    auto lease = std::make_shared<FrameLease>();
+    lease->tag.receiptId = ++gNextReceipt;
+    lease->tag.sourceFrame = snapshot.frameIndex;
+    lease->tag.handleId = handleId;
+    lease->tag.resetRequested = snapshot.reset;
+    lease->width = snapshot.outputWidth;
+    lease->height = snapshot.outputHeight;
+    lease->producer = commandList;
+    // Normalize the receipt identity to the interface ExecuteCommandLists sees.
+    IUnknown* realList = nullptr;
+    if (Util::CheckForRealObject("DlssdFrameReceipt", commandList, &realList) && realList)
+    {
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> normalized;
+        if (SUCCEEDED(realList->QueryInterface(IID_PPV_ARGS(&normalized))))
+            lease->producer = normalized;
+    }
+    Microsoft::WRL::ComPtr<ID3D12Device> receiptDevice;
     const char* copyError = nullptr;
-    if (!DlssdTranslatedSession::Evaluate(commandList, snapshot, nullptr, false, &copyError,
-                                          DlssdRuntimeFrame_CopyOnCallerList))
+    if (lease->producer->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+        FAILED(lease->producer->GetDevice(IID_PPV_ARGS(&receiptDevice))) ||
+        !lease->input.Initialize(receiptDevice.Get(), lease->tag.receiptId) ||
+        !DlssdTranslatedSession::BeginFrameLease(lease->tag, &copyError))
     {
         stagingLock.unlock();
-        if (copyError != nullptr && std::strcmp(copyError, "translated runtime is busy") == 0)
-            return SkipUnsafe(handleId, "runtime_busy", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
-        DlssdTranslatedSession::Release();
+        return SkipUnsafe(handleId, "receipt_begin_failed", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
+    }
+    for (const auto& input : snapshot.resources)
+    {
+        if (input.resource)
+            lease->resources.emplace_back(input.resource);
+        if (input.definition && input.definition->semantic == InputSemantic::Output)
+        {
+            lease->output = input.resource;
+            lease->outputX = input.subrectBaseX;
+            lease->outputY = input.subrectBaseY;
+        }
+    }
+    gFrameLease = lease;
+    gReceiptProducer.store(lease->producer.Get(), std::memory_order_release);
+    const bool copied = DlssdTranslatedSession::Evaluate(commandList, snapshot, nullptr, false, &copyError,
+                                                         DlssdRuntimeFrame_CopyOnCallerList);
+    // Append the receipt even after a partial copy failure: those recorded
+    // references still require submission completion or successful list Reset.
+    lease->copyFailed = !copied;
+    if (!copied)
+        LOG_WARN("DLSS-D frame receipt={} source_frame={} input_record_failed=1 reason={}",
+                 lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
+    if (!lease->input.Record(lease->producer.Get()))
+    {
+        lease->cancelled = true;
         gRuntimePoisoned.store(true, std::memory_order_relaxed);
-        gRejectedRuntime.fetch_add(1, std::memory_order_relaxed);
-        LOG_WARN("DLSS-D experimental backend handle={} caller-list input copy failed: {}", handleId,
-                 copyError != nullptr ? copyError : "unknown");
-        LogCounters(handleId, "translated runtime input copy failed");
-        FlushExperimentalLog();
-        NoteEvaluateBoundary();
+        stagingLock.unlock();
+        LOG_ERROR("DLSS-D frame receipt record failed; retaining staging and HIP allocations");
         return Decision::Rejected;
     }
 
@@ -1175,6 +1346,7 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
         AddRefJob(gPending, State::Instance().currentCommandQueue);
         gPending.handleId = handleId;
         gPending.extent = extent;
+        gPending.lease = lease;
         gHavePending = true;
     }
     stagingLock.unlock();
@@ -1205,7 +1377,7 @@ Decision Evaluate(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Graphi
         return Decision::NotEnabled;
 
     LogContractOnce();
-    LogPublicationUnavailable();
+    LogPublicationContract();
     gEvaluated.fetch_add(1, std::memory_order_relaxed);
 
     if (Config::Instance()->FSRRCaptureOnly.value_or_default())
@@ -1369,7 +1541,7 @@ Decision Evaluate(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Graphi
         return SkipUnsafe(handleId, "creating", idleMs, snapshot.reset, extent,
                           DlssdTranslatedSession::CreatingElapsedMs());
 
-    if (gHaveLastDispatch)
+    if (gHaveLastDispatch && !Config::Instance()->FSRRDlssdPresentTranslated.value_or_default())
     {
         const long long intervalRemainingMs = MsUntil(gLastDispatchAt, kExperimentalMinIntervalMs);
         if (intervalRemainingMs > 0)
@@ -1407,50 +1579,165 @@ Decision Evaluate(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Graphi
 
 void NotifyFrameSubmitted()
 {
-    if (!Enabled())
-        return;
-    if (!DlssdTranslatedSession::IsAttached() || DlssdTranslatedSession::IsCreating())
-        return;
-    // Parked by default: drop any pending work (releasing its queue/resource
-    // refs) instead of dispatching owner evaluates while not opted in.
-    if (PostAttachParked())
-    {
-        std::lock_guard lock(gJobMutex);
-        if (gHavePending)
-        {
-            ReleaseJob(gPending);
-            gHavePending = false;
-        }
-        return;
-    }
-    // Post-attach quiesce: drop any pre-attach pending work (releasing its
-    // queue/resource refs) instead of dispatching owner evaluates while the
-    // sidecar still settles.
-    if (PostAttachQuiesceRemainingMs() > 0)
-    {
-        std::lock_guard lock(gJobMutex);
-        if (gHavePending)
-        {
-            ReleaseJob(gPending);
-            gHavePending = false;
-        }
-        return;
-    }
-    // Transfer the single staging reservation atomically. Clearing pending
-    // before queueing the owner would allow the next NGX evaluate to overwrite
-    // staging in the gap, even though the session mutex is otherwise correct.
-    std::lock_guard lock(gJobMutex);
-    if (!gHavePending || gShutdown)
-        return;
-    if (gHaveJob || gOwnerBusy.load(std::memory_order_acquire))
-        return;
-    gJob = std::move(gPending);
-    gPending = {};
-    gHavePending = false;
-    gHaveJob = true;
-    gJobCv.notify_one();
+    // Present is not evidence that the staging command list executed.
+    // Only the exact ExecuteCommandLists receipt schedules the owner.
 }
 
+void NotifyCommandListReset(ID3D12GraphicsCommandList* list)
+{
+    // Private runtime lists can reset while the session is executing under
+    // its own lock. Only the retained producer participates in this receipt.
+    if (list != gReceiptProducer.load(std::memory_order_acquire))
+        return;
+    std::lock_guard lock(gJobMutex);
+    if (!gFrameLease)
+        return;
+    gFrameLease->input.OnSuccessfulReset(list);
+    if (gFrameLease->input.State() == DlssdInputReceipt::Receipt::Phase::Cancelled && gHavePending)
+    {
+        ReleaseJob(gPending);
+        gPending = {};
+        gHavePending = false;
+    }
+    RetireFrameLeaseLocked();
+}
+
+// All queue timeline operations are serialized by the hook's per-queue gate.
+// This function never holds gJobMutex across a GPU wait or owner evaluation.
+bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
+                               ID3D12CommandList* const* lists, ExecuteLists execute,
+                               const DlssdOutputHazardTrace::PublicationPlan& plan)
+{
+    if (!queue || !lists || !execute || !count || !Enabled())
+        return false;
+    std::shared_ptr<FrameLease> lease;
+    bool split = false;
+    UINT prefixCount = count;
+    {
+        std::lock_guard lock(gJobMutex);
+        if (!gHavePending || !gPending.lease || gShutdown || gHaveJob || gOwnerBusy.load())
+            return false;
+        lease = gPending.lease;
+        if (!lease->input.BeforeSubmit(queue, count, lists))
+            return false;
+        split = Config::Instance()->FSRRDlssdPresentTranslated.value_or_default() && plan.valid &&
+            !lease->copyFailed && !lease->cancelled && plan.handleId == lease->tag.handleId &&
+            plan.producer == lease->producer.Get() && plan.output == lease->output.Get() &&
+            plan.producerIndex == lease->input.ListIndex() && plan.producerIndex + 1 < count;
+        lease->split = split;
+        lease->handoffActive = true;
+        if (split)
+            prefixCount = plan.producerIndex + 1;
+    }
+    execute(queue, prefixCount, lists);
+    {
+        std::lock_guard lock(gJobMutex);
+        if (!lease->input.AfterSubmit(queue))
+        {
+            gRuntimePoisoned.store(true);
+            lease->cancelled = true;
+            lease->ownerDone = true;
+            ReleaseJob(gPending);
+            gPending = {};
+            gHavePending = false;
+        }
+        else
+        {
+            gJob = std::move(gPending);
+            gPending = {};
+            gHavePending = false;
+            gHaveJob = true;
+            gJobCv.notify_one();
+        }
+    }
+    if (!split)
+    {
+        std::lock_guard lock(gJobMutex);
+        lease->handoffActive = false;
+        return true;
+    }
+
+    bool ready = false;
+    {
+        std::unique_lock lock(gJobMutex);
+        const bool completed = gJobCv.wait_for(lock, std::chrono::seconds(9), [&] { return lease->ownerDone; });
+        ready = completed && lease->ownerOk && !lease->cancelled && lease->ready;
+        if (!ready)
+            lease->cancelled = true; // Late owners only touch their private output.
+    }
+    bool submitted = false;
+    uint32_t inputVerified = 0;
+    if (ready)
+    {
+        const auto src = lease->ready->GetDesc();
+        const auto dst = lease->output->GetDesc();
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        const bool compatible = src.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            dst.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && src.Format == dst.Format &&
+            src.SampleDesc.Count == 1 && dst.SampleDesc.Count == 1 &&
+            src.MipLevels == 1 && dst.MipLevels == 1 &&
+            src.DepthOrArraySize == 1 && dst.DepthOrArraySize == 1 &&
+            src.Width >= lease->width && src.Height >= lease->height &&
+            uint64_t(lease->outputX) + lease->width <= dst.Width &&
+            uint64_t(lease->outputY) + lease->height <= dst.Height;
+        if (compatible && SUCCEEDED(queue->GetDevice(IID_PPV_ARGS(&device))) &&
+            SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                     IID_PPV_ARGS(&lease->allocator))) &&
+            SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, lease->allocator.Get(), nullptr,
+                                                IID_PPV_ARGS(&lease->publicationList))) &&
+            SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&lease->publicationFence))))
+        {
+            D3D12_RESOURCE_BARRIER barriers[2] {};
+            barriers[0].Type = barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barriers[0].Transition = { lease->ready.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                static_cast<D3D12_RESOURCE_STATES>(lease->readyState), D3D12_RESOURCE_STATE_COPY_SOURCE };
+            barriers[1].Transition = { lease->output.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                static_cast<D3D12_RESOURCE_STATES>(plan.outputStateBefore), D3D12_RESOURCE_STATE_COPY_DEST };
+            for (auto& barrier : barriers)
+                if (barrier.Transition.StateBefore != barrier.Transition.StateAfter)
+                    lease->publicationList->ResourceBarrier(1, &barrier);
+            D3D12_TEXTURE_COPY_LOCATION source {}, destination {};
+            source.pResource = lease->ready.Get();
+            source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destination.pResource = lease->output.Get();
+            destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            const D3D12_BOX box { 0, 0, 0, lease->width, lease->height, 1 };
+            lease->publicationList->CopyTextureRegion(&destination, lease->outputX, lease->outputY, 0, &source, &box);
+            for (auto& barrier : barriers)
+            {
+                std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+                if (barrier.Transition.StateBefore != barrier.Transition.StateAfter)
+                    lease->publicationList->ResourceBarrier(1, &barrier);
+            }
+            if (SUCCEEDED(lease->publicationList->Close()))
+            {
+                ID3D12CommandList* publication = lease->publicationList.Get();
+                execute(queue, 1, &publication);
+                submitted = true;
+            }
+        }
+    }
+    // The original consumer suffix always executes, including on timeout.
+    // FSR-RR already wrote the matching fallback on the producer prefix.
+    execute(queue, count - prefixCount, lists + prefixCount);
+    const bool signalled = submitted && SUCCEEDED(queue->Signal(lease->publicationFence.Get(), 1));
+    {
+        std::lock_guard lock(gJobMutex);
+        lease->published = submitted;
+        lease->publicationSignalled = signalled;
+        lease->handoffActive = false;
+        inputVerified = lease->tag.inputSubmissionVerified;
+        if (submitted && !signalled)
+            gRuntimePoisoned.store(true);
+    }
+    gLastMatchedSubmitEnd.store(Clock::now().time_since_epoch().count(), std::memory_order_release);
+    LOG_INFO("DLSS-D frame receipt={} source_frame={} feature=13 handle={} input_verified={} "
+             "publication_submitted={} completion_signalled={} producer_index={} suffix_count={} state_before=0x{:X}",
+             lease->tag.receiptId, lease->tag.sourceFrame, lease->tag.handleId, inputVerified,
+             submitted ? 1 : 0, signalled ? 1 : 0, prefixCount - 1, count - prefixCount, plan.outputStateBefore);
+    FlushExperimentalLog();
+    return true;
+}
 void Release(uint32_t handleId)
 {
     if (!Enabled())

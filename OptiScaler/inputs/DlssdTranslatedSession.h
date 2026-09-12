@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#include "../../native/dlssd_frame_lease.h"
+
 struct ID3D12Device;
 struct ID3D12GraphicsCommandList;
 struct NVSDK_NGX_Parameter;
@@ -35,6 +37,10 @@ bool CreateProgress(uint32_t* allocHeartbeats, uint32_t* functionsCreated);
 bool AttachLoadBypassActive();
 HMODULE LoadSidecarNvapiForAttach();
 HMODULE NvapiHandleForAttach();
+bool BeginFrameLease(const DlssdFrameTag& tag, const char** error);
+bool VerifyFrameInput(const DlssdFrameTag& tag, const char** error);
+bool GetReadyOutput(DlssdReadyOutput& output, const char** error);
+bool EndFrameLease(uint64_t receiptId, uint32_t retirement, const char** error);
 bool Evaluate(ID3D12GraphicsCommandList* commandList, const RayReconstruction::InputSnapshot& snapshot,
               NVSDK_NGX_Parameter* parameters, bool publishOutput, const char** error,
               uint32_t runtimeFlags = 0);
