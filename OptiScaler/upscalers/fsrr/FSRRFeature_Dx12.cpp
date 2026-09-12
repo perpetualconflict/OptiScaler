@@ -255,6 +255,9 @@ struct FSRRFeatureDx12::Impl
     bool resetHistory = true;
     bool hasPreviousCamera = false;
     bool loggedFirstDispatch = false;
+    std::string lastOutputRoute;
+    bool lastOutputResult = false;
+    uint64_t outputRouteTransitions = 0;
     std::optional<uint32_t> lastDebugOutput;
     uint32_t contextWidth = 0;
     uint32_t contextHeight = 0;
@@ -263,6 +266,22 @@ struct FSRRFeatureDx12::Impl
     std::string lastInventorySignature;
     std::string lastFailureKey;
     std::string lastWarningKey;
+
+    void RecordOutputRoute(uint32_t handleId, uint32_t frame, const char* route, bool result)
+    {
+        if (lastOutputRoute != route || lastOutputResult != result)
+        {
+            ++outputRouteTransitions;
+            // Keep pathological per-frame alternation from flooding the log.
+            if (outputRouteTransitions <= 32 || outputRouteTransitions % 600 == 0)
+                LOG_INFO("FSR-RR output route changed: handle={} frame={} previous={} route={} recorded_ok={} transition={} "
+                         "note=CPU_recording_result_not_present_proof",
+                         handleId, frame, lastOutputRoute.empty() ? "none" : lastOutputRoute, route, result,
+                         outputRouteTransitions);
+            lastOutputRoute = route;
+            lastOutputResult = result;
+        }
+    }
 
     void FailOnce(const InputSnapshot* snapshot, const std::string& reason)
     {
@@ -289,7 +308,9 @@ FSRRFeatureDx12::~FSRRFeatureDx12()
 bool FSRRFeatureDx12::EvaluateFallback(ID3D12GraphicsCommandList* commandList,
                                       NVSDK_NGX_Parameter* parameters)
 {
+    const auto frame = static_cast<uint32_t>(_frameCount);
     const bool result = FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+    _impl->RecordOutputRoute(Handle()->Id, frame, "fsr212_fallback", result);
 
     auto& changeRequested = State::Instance().changeBackend[Handle()->Id];
     if (changeRequested)
@@ -429,6 +450,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
         experimental == DlssdExperimentalBackend::Decision::Dispatched)
     {
         _impl->lastFailureKey.clear();
+        _impl->RecordOutputRoute(Handle()->Id, snapshot.frameIndex, "translated_caller_output", true);
         return true;
     }
     else if (experimental == DlssdExperimentalBackend::Decision::Unpublished)
@@ -734,6 +756,7 @@ bool FSRRFeatureDx12::EvaluateInternal(ID3D12GraphicsCommandList* commandList, N
 
     ScopedNgxResourceReplacement replaceColor(parameters, NVSDK_NGX_Parameter_Color, originalColor, composedColor);
     const bool result = FSR2FeatureDx12_212::EvaluateInternal(commandList, parameters);
+    _impl->RecordOutputRoute(Handle()->Id, snapshot.frameIndex, "fsrr_recomposed_fsr212", result);
     if (!result)
         _impl->resetHistory = true;
     return result;

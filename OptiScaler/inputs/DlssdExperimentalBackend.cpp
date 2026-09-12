@@ -815,9 +815,9 @@ void OwnerLoop()
                 // private sample. Reset only this diagnostic job's history.
                 const auto requestedReset = job.snapshot.reset;
                 job.snapshot.reset = 1;
-                LOG_INFO("DLSS-D experimental backend handle={} owner evaluate reset_requested={} reset_effective={} "
+                LOG_INFO("DLSS-D experimental backend handle={} owner evaluate source_ngx_frame={} reset_requested={} reset_effective={} "
                          "reason=sparse_owner_history",
-                         job.handleId, requestedReset, job.snapshot.reset);
+                         job.handleId, job.snapshot.frameIndex, requestedReset, job.snapshot.reset);
                 FlushExperimentalLog();
                 ok = DlssdTranslatedSession::Evaluate(nullptr, job.snapshot, nullptr, false, &error,
                                                       DlssdRuntimeFrame_SkipInputCopy);
