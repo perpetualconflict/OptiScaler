@@ -195,6 +195,12 @@ struct FrameLease
 // was never proven. Normal retirement resets it and frees all owned objects.
 auto& gFrameLease = *new std::shared_ptr<FrameLease>();
 std::atomic<ID3D12GraphicsCommandList*> gReceiptProducer { nullptr };
+// Reset observed by hkReset while gJobMutex was unavailable (2026-09-12
+// EDEADLK: Record -> re-entrant Reset on the producer under stagingLock).
+// Raw pointer, never dereferenced without validation: compared against the
+// retained producer under lock, then cleared. Hook callbacks must never
+// block on gJobMutex.
+std::atomic<ID3D12GraphicsCommandList*> gDeferredResetProducer { nullptr };
 uint64_t gNextReceipt = 0;
 uint64_t gPreviousOwnerFrame = 0;
 uint32_t gPreviousOwnerHandle = 0;
@@ -444,11 +450,40 @@ bool RetireFrameLeaseLocked()
     return true;
 }
 
+// Caller holds gJobMutex. Applies one producer reset: cancel a recorded-but-
+// unsubmitted receipt, drop its pending job, and retire when possible.
+void ApplyProducerResetLocked(ID3D12GraphicsCommandList* list)
+{
+    if (!gFrameLease || list != gFrameLease->producer.Get())
+        return;
+    gFrameLease->input.OnSuccessfulReset(list);
+    if (gFrameLease->input.State() == DlssdInputReceipt::Receipt::Phase::Cancelled && gHavePending)
+    {
+        ReleaseJob(gPending);
+        gPending = {};
+        gHavePending = false;
+    }
+    RetireFrameLeaseLocked();
+}
+
+// Caller holds gJobMutex. Applies a reset deferred by NotifyCommandListReset
+// when the lock was unavailable. Observations for an already-retired producer
+// are dropped by the producer check above.
+void DrainDeferredResetLocked()
+{
+    ID3D12GraphicsCommandList* list =
+        gDeferredResetProducer.exchange(nullptr, std::memory_order_acq_rel);
+    if (list == nullptr)
+        return;
+    ApplyProducerResetLocked(list);
+}
+
 void DropTranslatedMappings()
 {
     bool releaseNow = true;
     {
         std::unique_lock lock(gJobMutex);
+        DrainDeferredResetLocked();
         if (!RetireFrameLeaseLocked())
         {
             // A CPU timeout or feature reset cannot revoke recorded GPU work.
@@ -1277,6 +1312,7 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     if (!DlssdOutputHazardTrace::ReceiptsAvailable())
         return SkipUnsafe(handleId, "receipt_hooks_unavailable", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
     std::unique_lock stagingLock(gJobMutex);
+    DrainDeferredResetLocked();
     if (gShutdown || gHavePending || gHaveJob || gOwnerBusy.load(std::memory_order_acquire) ||
         !RetireFrameLeaseLocked())
     {
@@ -1587,19 +1623,21 @@ void NotifyCommandListReset(ID3D12GraphicsCommandList* list)
 {
     // Private runtime lists can reset while the session is executing under
     // its own lock. Only the retained producer participates in this receipt.
+    // This runs on hooked game threads that may already hold gJobMutex
+    // (2026-09-12 EDEADLK via Record -> re-entrant Reset on the producer),
+    // so never block: defer the observation for the next lock holder.
     if (list != gReceiptProducer.load(std::memory_order_acquire))
         return;
-    std::lock_guard lock(gJobMutex);
-    if (!gFrameLease)
-        return;
-    gFrameLease->input.OnSuccessfulReset(list);
-    if (gFrameLease->input.State() == DlssdInputReceipt::Receipt::Phase::Cancelled && gHavePending)
+    std::unique_lock lock(gJobMutex, std::try_to_lock);
+    if (!lock.owns_lock())
     {
-        ReleaseJob(gPending);
-        gPending = {};
-        gHavePending = false;
+        gDeferredResetProducer.store(list, std::memory_order_release);
+        return;
     }
-    RetireFrameLeaseLocked();
+    // A previously deferred reset for this producer is still valid; apply it
+    // first so observation order is preserved (repeats are idempotent).
+    DrainDeferredResetLocked();
+    ApplyProducerResetLocked(list);
 }
 
 // All queue timeline operations are serialized by the hook's per-queue gate.
@@ -1615,6 +1653,7 @@ bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
     UINT prefixCount = count;
     {
         std::lock_guard lock(gJobMutex);
+        DrainDeferredResetLocked();
         if (!gHavePending || !gPending.lease || gShutdown || gHaveJob || gOwnerBusy.load())
             return false;
         lease = gPending.lease;
