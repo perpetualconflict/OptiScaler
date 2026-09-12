@@ -825,7 +825,11 @@ void OwnerLoop()
             const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - enter).count();
             ReleaseJob(job);
 
-            if (!ok && waitFailed)
+            // A busy session is a skip, never a poison: with try-lock on both
+            // paths the owner can lose to a game thread inside prepare/release.
+            const bool busyFailed =
+                !ok && !waitFailed && error != nullptr && std::strcmp(error, "translated runtime is busy") == 0;
+            if (!ok && (waitFailed || busyFailed))
             {
                 gSkippedUnsafe.fetch_add(1, std::memory_order_relaxed);
                 LOG_WARN("DLSS-D experimental backend handle={} owner skipped after {} ms: {}", job.handleId, elapsedMs,

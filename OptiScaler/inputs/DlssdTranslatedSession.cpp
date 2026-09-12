@@ -550,11 +550,12 @@ bool Evaluate(ID3D12GraphicsCommandList* commandList, const InputSnapshot& snaps
               bool publishOutput, const char** error, uint32_t runtimeFlags)
 {
     (void) parameters;
-    const bool blockForRuntime = (runtimeFlags & DlssdRuntimeFrame_SkipInputCopy) != 0;
+    // Crash hardening (2026-09-07): never block any thread on the session
+    // lock. The owner used to block here while the game thread can hold the
+    // lock across sidecar loads; a busy owner now skips the frame instead and
+    // the backend requeues fail-closed, mirroring the caller-list path.
     std::unique_lock lock(gLock, std::defer_lock);
-    if (blockForRuntime)
-        lock.lock();
-    else if (!lock.try_lock())
+    if (!lock.try_lock())
     {
         if (error)
             *error = "translated runtime is busy";
