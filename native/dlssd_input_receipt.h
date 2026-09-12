@@ -143,6 +143,13 @@ class Receipt
         return !replayed_ && (phase_ == Phase::Empty || phase_ == Phase::Cancelled || (reset_ && gpuComplete_));
     }
     Phase State() const { return phase_; }
+    // Read-only introspection for submission-mismatch diagnostics. The
+    // recorded pointer is only meaningful while the caller retains the
+    // receipt; compare, never dereference, outside the receipt lock.
+    ID3D12GraphicsCommandList* RecordedList() const
+    {
+        return const_cast<ID3D12GraphicsCommandList*>(list_.Get());
+    }
     UINT ListIndex() const { return index_; }
     ID3D12CommandQueue* SubmissionQueue() const { return queue_.Get(); }
 

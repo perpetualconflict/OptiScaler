@@ -64,6 +64,11 @@ std::atomic<uint32_t> gDispatched { 0 };
 std::atomic<uint32_t> gOwnerOk { 0 };
 std::atomic<uint32_t> gOwnerFailed { 0 };
 std::atomic<uint32_t> gPublished { 0 };
+// Starvation diagnostics (2026-09-12): why leases never reach Submitted.
+// Counters only; call sites throttle the log lines. No behavior change.
+std::atomic<uint32_t> gDeferredResetApplied { 0 };
+std::atomic<uint32_t> gResetCancels { 0 };
+std::atomic<uint32_t> gSubmitMismatches { 0 };
 std::mutex gFailInventoryMutex;
 struct FailEntry
 {
@@ -456,14 +461,32 @@ void ApplyProducerResetLocked(ID3D12GraphicsCommandList* list)
 {
     if (!gFrameLease || list != gFrameLease->producer.Get())
         return;
+    const auto before = gFrameLease->input.State();
+    const bool hadPending = gHavePending;
+    const uint64_t receipt = gFrameLease->tag.receiptId;
     gFrameLease->input.OnSuccessfulReset(list);
-    if (gFrameLease->input.State() == DlssdInputReceipt::Receipt::Phase::Cancelled && gHavePending)
+    const bool cancelledNow =
+        gFrameLease->input.State() == DlssdInputReceipt::Receipt::Phase::Cancelled;
+    if (cancelledNow && gHavePending)
     {
         ReleaseJob(gPending);
         gPending = {};
         gHavePending = false;
     }
     RetireFrameLeaseLocked();
+    // Cancel attribution: a Recorded receipt dropped with a live pending job
+    // is the starvation path (never reaches BeforeSubmit as Recorded). Read
+    // before retire, which may release the lease.
+    if (hadPending && before == DlssdInputReceipt::Receipt::Phase::Recorded && cancelledNow)
+    {
+        const auto total = gResetCancels.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (total <= 2 || (total % 120) == 0)
+        {
+            LOG_WARN("DLSS-D frame receipt={} cancelled by producer Reset total={} producer={:p} tid={}",
+                     receipt, total, (void*) list, GetCurrentThreadId());
+            FlushExperimentalLog();
+        }
+    }
 }
 
 // Caller holds gJobMutex. Applies a reset deferred by NotifyCommandListReset
@@ -475,7 +498,19 @@ void DrainDeferredResetLocked()
         gDeferredResetProducer.exchange(nullptr, std::memory_order_acq_rel);
     if (list == nullptr)
         return;
+    const bool live = gFrameLease && list == gFrameLease->producer.Get();
+    const uint64_t receipt = live ? gFrameLease->tag.receiptId : 0;
     ApplyProducerResetLocked(list);
+    if (live)
+    {
+        const auto total = gDeferredResetApplied.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (total <= 3 || (total % 120) == 0)
+        {
+            LOG_INFO("DLSS-D deferred producer reset applied receipt={} total={} tid={}", receipt, total,
+                     GetCurrentThreadId());
+            FlushExperimentalLog();
+        }
+    }
 }
 
 void DropTranslatedMappings()
@@ -1335,6 +1370,9 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
         if (SUCCEEDED(realList->QueryInterface(IID_PPV_ARGS(&normalized))))
             lease->producer = normalized;
     }
+    // Starvation diagnosis: whether the recorded identity differs from the
+    // Evaluate caller determines if BeforeSubmit can ever match.
+    const bool producerNormalized = lease->producer.Get() != commandList;
     Microsoft::WRL::ComPtr<ID3D12Device> receiptDevice;
     const char* copyError = nullptr;
     if (lease->producer->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
@@ -1390,9 +1428,9 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     gLastDispatchAt = Clock::now();
     gHaveLastDispatch = true;
     LOG_INFO("DLSS-D experimental backend handle={} evaluate prepared publish=0 evaluated={} dispatched={} "
-             "extent={} tid={}",
+             "extent={} tid={} producer={:p} normalized={}",
              handleId, gEvaluated.load(), gDispatched.load(), extent != nullptr ? extent->name : "none",
-             GetCurrentThreadId());
+             GetCurrentThreadId(), (void*) lease->producer.Get(), producerNormalized ? 1 : 0);
     FlushExperimentalLog();
     NoteEvaluateBoundary();
     return Decision::Unpublished;
@@ -1657,8 +1695,35 @@ bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
         if (!gHavePending || !gPending.lease || gShutdown || gHaveJob || gOwnerBusy.load())
             return false;
         lease = gPending.lease;
-        if (!lease->input.BeforeSubmit(queue, count, lists))
-            return false;
+        {
+            // Starvation diagnosis: BeforeSubmit is silent on mismatch and it
+            // mutates phase, so snapshot the comparison inputs first.
+            const auto phase = lease->input.State();
+            auto* recorded = lease->input.RecordedList();
+            UINT matches = 0;
+            for (UINT i = 0; i < count; ++i)
+            {
+                if (lists[i] == static_cast<ID3D12CommandList*>(recorded))
+                    ++matches;
+            }
+            D3D12_COMMAND_QUEUE_DESC queueDesc {};
+            if (queue != nullptr)
+                queueDesc = queue->GetDesc();
+            if (!lease->input.BeforeSubmit(queue, count, lists))
+            {
+                const auto total = gSubmitMismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (total <= 3 || (total % 60) == 0)
+                {
+                    LOG_WARN("DLSS-D frame receipt={} submission mismatch total={} phase={} matches={}/{} "
+                             "queueType={} producer={:p} recorded={:p} tid={}",
+                             lease->tag.receiptId, total, static_cast<int>(phase), matches, count,
+                             static_cast<int>(queueDesc.Type), (void*) lease->producer.Get(), (void*) recorded,
+                             GetCurrentThreadId());
+                    FlushExperimentalLog();
+                }
+                return false;
+            }
+        }
         split = Config::Instance()->FSRRDlssdPresentTranslated.value_or_default() && plan.valid &&
             !lease->copyFailed && !lease->cancelled && plan.handleId == lease->tag.handleId &&
             plan.producer == lease->producer.Get() && plan.output == lease->output.Get() &&
