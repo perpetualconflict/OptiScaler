@@ -72,6 +72,42 @@ std::atomic<uint32_t> gResetCancels { 0 };
 std::atomic<uint32_t> gSubmitMismatches { 0 };
 std::atomic<uint32_t> gSubmitMatches { 0 };
 std::atomic<uint32_t> gAfterSubmitFails { 0 };
+std::atomic<uint32_t> gNativeMatches { 0 };
+// SL proxy resolution for submission matching (2026-09-13): sl.dlss_d
+// forwards the NATIVE list (common::getNativeCommandBuffer) to NGX while the
+// game may submit the SL proxy, so raw pointer comparison can never hit.
+// slGetNativeInterface (sl.interposer.dll, public export) maps proxy ->
+// native and passes natives through. Loaded without side effects: SL is
+// already in-process; GetModuleHandle never loads anything new.
+using SlGetNativeInterfaceFn = int (*)(void* proxyInterface, void** baseInterface);
+SlGetNativeInterfaceFn gSlGetNativeInterface = nullptr;
+std::once_flag gSlResolverInit;
+void EnsureSlResolver()
+{
+    std::call_once(gSlResolverInit,
+                   []
+                   {
+                       if (const HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll"))
+                       {
+                           gSlGetNativeInterface = reinterpret_cast<SlGetNativeInterfaceFn>(
+                               GetProcAddress(interposer, "slGetNativeInterface"));
+                       }
+                   });
+}
+// Compare-only native identity. Drops the AddRef the resolver grants; the
+// game owns both lifetimes across the Execute call. Falls back to the raw
+// pointer when the resolver is unavailable or rejects the object.
+void* ResolveNativeForMatch(void* list)
+{
+    EnsureSlResolver();
+    if (gSlGetNativeInterface == nullptr || list == nullptr)
+        return list;
+    void* base = nullptr;
+    if (gSlGetNativeInterface(list, &base) != 0 || base == nullptr)
+        return list;
+    static_cast<IUnknown*>(base)->Release();
+    return base;
+}
 std::mutex gFailInventoryMutex;
 struct FailEntry
 {
@@ -1462,10 +1498,11 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
 
     gLastDispatchAt = Clock::now();
     gHaveLastDispatch = true;
+    void* const nativeProducer = ResolveNativeForMatch(lease->producer.Get());
     LOG_INFO("DLSS-D experimental backend handle={} evaluate prepared publish=0 evaluated={} dispatched={} "
-             "extent={} tid={} producer={:p} normalized={}",
+             "extent={} tid={} producer={:p} normalized={} nativeProducer={:p}",
              handleId, gEvaluated.load(), gDispatched.load(), extent != nullptr ? extent->name : "none",
-             GetCurrentThreadId(), (void*) lease->producer.Get(), producerNormalized ? 1 : 0);
+             GetCurrentThreadId(), (void*) lease->producer.Get(), producerNormalized ? 1 : 0, nativeProducer);
     FlushExperimentalLog();
     NoteEvaluateBoundary();
     return Decision::Unpublished;
@@ -1755,11 +1792,26 @@ bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
             // mutates phase, so snapshot the comparison inputs first.
             const auto phase = lease->input.State();
             auto* recorded = lease->input.RecordedList();
-            UINT matches = 0;
+            void* const recordedNative = ResolveNativeForMatch(recorded);
+            UINT matches = 0, nativeMatches = 0;
             for (UINT i = 0; i < count; ++i)
             {
                 if (lists[i] == static_cast<ID3D12CommandList*>(recorded))
                     ++matches;
+                if (ResolveNativeForMatch(lists[i]) == recordedNative)
+                    ++nativeMatches;
+            }
+            if (nativeMatches > 0)
+            {
+                const auto nativeTotal = gNativeMatches.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (nativeTotal <= 3 || (nativeTotal % 60) == 0)
+                {
+                    LOG_INFO("DLSS-D frame receipt={} native submission match nativeTotal={} nativeMatches={}/{} "
+                             "recordedNative={:p} tid={}",
+                             lease->tag.receiptId, nativeTotal, nativeMatches, count, recordedNative,
+                             GetCurrentThreadId());
+                    FlushExperimentalLog();
+                }
             }
             D3D12_COMMAND_QUEUE_DESC queueDesc {};
             if (queue != nullptr)
@@ -1770,10 +1822,10 @@ bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
                 if (total <= 3 || (total % 60) == 0)
                 {
                     LOG_WARN("DLSS-D frame receipt={} submission mismatch total={} phase={} matches={}/{} "
-                             "queueType={} producer={:p} recorded={:p} tid={}",
-                             lease->tag.receiptId, total, static_cast<int>(phase), matches, count,
-                             static_cast<int>(queueDesc.Type), (void*) lease->producer.Get(), (void*) recorded,
-                             GetCurrentThreadId());
+                             "nativeMatches={}/{} queueType={} producer={:p} recorded={:p} recordedNative={:p} tid={}",
+                             lease->tag.receiptId, total, static_cast<int>(phase), matches, count, nativeMatches,
+                             count, static_cast<int>(queueDesc.Type), (void*) lease->producer.Get(),
+                             (void*) recorded, recordedNative, GetCurrentThreadId());
                     FlushExperimentalLog();
                 }
                 return false;
