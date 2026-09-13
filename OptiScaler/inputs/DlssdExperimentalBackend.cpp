@@ -1376,6 +1376,239 @@ struct StagingLock
     }
 };
 
+// Phase-1 owned capture (2026-09-13): the NGX-time game list is never
+// submitted, so input copies recorded onto it never execute. Record sidecar
+// input copies onto a private list instead, submit it on a private queue,
+// and prove execution (fence) plus data movement (64x64 color probe hashed
+// on CPU). The game picture stays on the fallback path and no owner handoff
+// happens yet. Caller holds the staging lock; the GPU wait is bounded and
+// every failure keeps the existing fail-closed lease path.
+struct OwnedCapture
+{
+    Microsoft::WRL::ComPtr<ID3D12Device> device;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    Microsoft::WRL::ComPtr<ID3D12Resource> probe;
+    HANDLE event = nullptr;
+    UINT64 fenceValue = 0;
+    UINT64 probeBytes = 0;
+    UINT probeWidth = 0;
+    UINT probeHeight = 0;
+    DXGI_FORMAT probeFormat = DXGI_FORMAT_UNKNOWN;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT probeLayout {};
+    bool listOpen = false;
+    D3D12_RESOURCE_DESC colorDesc {};
+    bool haveColorDesc = false;
+};
+OwnedCapture gOwnedCapture {};
+
+void DropOwnedCapture()
+{
+    if (gOwnedCapture.event != nullptr)
+    {
+        CloseHandle(gOwnedCapture.event);
+        gOwnedCapture.event = nullptr;
+    }
+    gOwnedCapture = OwnedCapture {};
+}
+
+uint64_t Fnv1a64(const void* data, size_t bytes)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    const auto* begin = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < bytes; ++i)
+    {
+        hash ^= begin[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+// Creates (once per device/format) and opens the private copy list. Leaves
+// it open on success for the sidecar plus probe recordings below.
+bool EnsureOwnedCapture(ID3D12Device* device, ID3D12Resource* color, const char** error)
+{
+    if (device == nullptr || color == nullptr)
+    {
+        if (error)
+            *error = "owned capture needs a device and color input";
+        return false;
+    }
+    const D3D12_RESOURCE_DESC colorDesc = color->GetDesc();
+    if (gOwnedCapture.device.Get() != device || gOwnedCapture.probeFormat != colorDesc.Format ||
+        gOwnedCapture.queue == nullptr)
+    {
+        DropOwnedCapture();
+        D3D12_COMMAND_QUEUE_DESC queueDesc {};
+        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&gOwnedCapture.queue))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&gOwnedCapture.fence))) ||
+            FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                  IID_PPV_ARGS(&gOwnedCapture.allocator))) ||
+            FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gOwnedCapture.allocator.Get(),
+                                              nullptr, IID_PPV_ARGS(&gOwnedCapture.list))))
+        {
+            if (error)
+                *error = "owned capture queue/allocator/list creation failed";
+            DropOwnedCapture();
+            return false;
+        }
+        gOwnedCapture.list->Close();
+        gOwnedCapture.listOpen = false;
+        // 64x64 probe of the color input into a CPU-visible buffer.
+        const UINT probeW = (std::min)(64u, static_cast<UINT>(colorDesc.Width));
+        const UINT probeH = (std::min)(64u, colorDesc.Height);
+        D3D12_RESOURCE_DESC probeDesc = colorDesc;
+        probeDesc.Width = probeW;
+        probeDesc.Height = probeH;
+        probeDesc.DepthOrArraySize = 1;
+        probeDesc.MipLevels = 1;
+        probeDesc.SampleDesc.Count = 1;
+        probeDesc.SampleDesc.Quality = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout {};
+        UINT rows = 0;
+        UINT64 rowSize = 0, totalBytes = 0;
+        device->GetCopyableFootprints(&probeDesc, 0, 1, 0, &layout, &rows, &rowSize, &totalBytes);
+        if (totalBytes == 0 || probeW == 0 || probeH == 0)
+        {
+            if (error)
+                *error = "owned capture probe footprint is empty";
+            DropOwnedCapture();
+            return false;
+        }
+        D3D12_HEAP_PROPERTIES heap {};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC bufferDesc {};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = totalBytes;
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.SampleDesc.Quality = 0;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                   IID_PPV_ARGS(&gOwnedCapture.probe))))
+        {
+            if (error)
+                *error = "owned capture probe buffer creation failed";
+            DropOwnedCapture();
+            return false;
+        }
+        gOwnedCapture.event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (gOwnedCapture.event == nullptr)
+        {
+            if (error)
+                *error = "owned capture event creation failed";
+            DropOwnedCapture();
+            return false;
+        }
+        gOwnedCapture.device = device;
+        gOwnedCapture.probeLayout = layout;
+        gOwnedCapture.probeBytes = totalBytes;
+        gOwnedCapture.probeWidth = probeW;
+        gOwnedCapture.probeHeight = probeH;
+        gOwnedCapture.probeFormat = colorDesc.Format;
+        gOwnedCapture.colorDesc = colorDesc;
+        gOwnedCapture.haveColorDesc = true;
+    }
+    if (gOwnedCapture.listOpen)
+    {
+        gOwnedCapture.list->Close();
+        gOwnedCapture.listOpen = false;
+    }
+    if (FAILED(gOwnedCapture.allocator->Reset()) ||
+        FAILED(gOwnedCapture.list->Reset(gOwnedCapture.allocator.Get(), nullptr)))
+    {
+        if (error)
+            *error = "owned capture list reset failed";
+        return false;
+    }
+    gOwnedCapture.listOpen = true;
+    return true;
+}
+
+// Closes the private list, submits it, waits bounded for the fence, and
+// hashes the color probe. States mirror the sidecar's Streamline 2.12
+// evaluate assumption (non-output inputs are PIXEL_SHADER_RESOURCE).
+bool SubmitOwnedProbe(ID3D12Resource* color, uint64_t& hash, long long& elapsedMs, const char** error)
+{
+    const auto enter = Clock::now();
+    auto finishMs = [&]
+    {
+        elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - enter).count();
+    };
+    if (color == nullptr)
+    {
+        if (error)
+            *error = "owned capture submitted without color";
+        finishMs();
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER toCopy {};
+    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toCopy.Transition.pResource = color;
+    toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    gOwnedCapture.list->ResourceBarrier(1, &toCopy);
+    D3D12_TEXTURE_COPY_LOCATION dst {};
+    dst.pResource = gOwnedCapture.probe.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = gOwnedCapture.probeLayout;
+    D3D12_TEXTURE_COPY_LOCATION src {};
+    src.pResource = color;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+    D3D12_BOX box {};
+    box.left = 0;
+    box.top = 0;
+    box.front = 0;
+    box.right = gOwnedCapture.probeWidth;
+    box.bottom = gOwnedCapture.probeHeight;
+    box.back = 1;
+    gOwnedCapture.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    std::swap(toCopy.Transition.StateBefore, toCopy.Transition.StateAfter);
+    gOwnedCapture.list->ResourceBarrier(1, &toCopy);
+    if (FAILED(gOwnedCapture.list->Close()))
+    {
+        if (error)
+            *error = "owned capture list close failed";
+        gOwnedCapture.listOpen = false;
+        finishMs();
+        return false;
+    }
+    gOwnedCapture.listOpen = false;
+    ID3D12CommandList* lists[] = { gOwnedCapture.list.Get() };
+    gOwnedCapture.queue->ExecuteCommandLists(1, lists);
+    const UINT64 value = ++gOwnedCapture.fenceValue;
+    if (FAILED(gOwnedCapture.queue->Signal(gOwnedCapture.fence.Get(), value)) ||
+        FAILED(gOwnedCapture.fence->SetEventOnCompletion(value, gOwnedCapture.event)) ||
+        WaitForSingleObject(gOwnedCapture.event, 250) != WAIT_OBJECT_0)
+    {
+        if (error)
+            *error = "owned capture fence wait timed out";
+        finishMs();
+        return false;
+    }
+    void* mapped = nullptr;
+    if (FAILED(gOwnedCapture.probe->Map(0, nullptr, &mapped)) || mapped == nullptr)
+    {
+        if (error)
+            *error = "owned capture probe map failed";
+        finishMs();
+        return false;
+    }
+    hash = Fnv1a64(mapped, static_cast<size_t>(gOwnedCapture.probeBytes));
+    gOwnedCapture.probe->Unmap(0, nullptr);
+    finishMs();
+    return true;
+}
+
 Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Device* device,
                                    ID3D12GraphicsCommandList* commandList, const AcceptedExtent* extent)
 {
@@ -1556,8 +1789,18 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
             }
         }
     }
-    const bool copied = DlssdTranslatedSession::Evaluate(commandList, snapshot, nullptr, false, &copyError,
-                                                         DlssdRuntimeFrame_CopyOnCallerList);
+    // Phase-1 owned capture: record sidecar input copies onto the private
+    // list (the game list is never submitted, so copies there never run).
+    const auto* colorInput = snapshot.Find(InputSemantic::Color);
+    ID3D12Resource* colorResource = (colorInput != nullptr) ? colorInput->resource : nullptr;
+    ID3D12GraphicsCommandList* ownedList = nullptr;
+    if (EnsureOwnedCapture(device, colorResource, &copyError))
+        ownedList = gOwnedCapture.list.Get();
+    else
+        LOG_WARN("DLSS-D frame receipt={} source_frame={} owned_capture_unavailable=1 reason={}",
+                 lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
+    const bool copied = DlssdTranslatedSession::Evaluate(ownedList != nullptr ? ownedList : commandList, snapshot,
+                                                         nullptr, false, &copyError, DlssdRuntimeFrame_CopyOnCallerList);
     // Append the receipt even after a partial copy failure: those recorded
     // references still require submission completion or successful list Reset.
     lease->copyFailed = !copied;
@@ -1574,14 +1817,24 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     }
 
     {
-        gPending = {};
-        gPending.op = OwnerOp::Evaluate;
-        gPending.snapshot = snapshot;
-        AddRefJob(gPending, State::Instance().currentCommandQueue);
-        gPending.handleId = handleId;
-        gPending.extent = extent;
-        gPending.lease = lease;
-        gHavePending = true;
+        // No owner handoff in phase 1: submit the owned capture instead and
+        // retire the lease next frame. The game picture stays on fallback.
+        const char* captureError = nullptr;
+        uint64_t captureHash = 0;
+        long long captureMs = 0;
+        if (ownedList != nullptr && SubmitOwnedProbe(colorResource, captureHash, captureMs, &captureError))
+        {
+            LOG_INFO("DLSS-D frame receipt={} source_frame={} owned_capture=1 hash={:016x} ms={}",
+                     lease->tag.receiptId, lease->tag.sourceFrame, captureHash, captureMs);
+        }
+        else
+        {
+            LOG_WARN("DLSS-D frame receipt={} source_frame={} owned_capture=0 reason={}",
+                     lease->tag.receiptId, lease->tag.sourceFrame,
+                     captureError != nullptr ? captureError : "unknown");
+        }
+        FlushExperimentalLog();
+        lease->cancelled = true;
     }
     stagingLock.unlock();
 
