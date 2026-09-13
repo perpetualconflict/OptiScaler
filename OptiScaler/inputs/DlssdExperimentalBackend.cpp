@@ -409,6 +409,17 @@ bool OwnerEvaluatesAllowed()
     return Config::Instance()->FSRRDlssdOwnerEvaluates.value_or_default();
 }
 
+// Capture-vehicle switch (2026-09-13): legacy game-list receipts only submit
+// on titles whose NGX evaluate lists execute normally (Cyberpunk 2077's do
+// not: raw, native, and ring-tracked matching all stay silent). Default
+// owned-list capture; opt in per game via the quirk table.
+bool UseGameListCapture()
+{
+    if (State::Instance().gameQuirks & GameQuirk::DlssdGameListCapture)
+        return true;
+    return false;
+}
+
 void LogPublicationContract()
 {
     if (!Config::Instance()->FSRRDlssdPresentTranslated.value_or_default())
@@ -1806,9 +1817,11 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     // whose caller list has not been submitted yet. Never replace that job.
     if (!DlssdOutputHazardTrace::ReceiptsAvailable())
         return SkipUnsafe(handleId, "receipt_hooks_unavailable", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
+    // Capture vehicle is process-stable (the quirk table is init-time).
+    const bool gameListCapture = UseGameListCapture();
     StagingLock stagingLock;
     DrainDeferredResetLocked();
-    if (gFrameLease && !gFrameLease->ownedCaptured && !gFrameLease->cancelled)
+    if (!gameListCapture && gFrameLease && !gFrameLease->ownedCaptured && !gFrameLease->cancelled)
     {
         // Wedge guard: an uncaptured lease with no Execute within 1 s fails
         // closed so the bridge keeps flowing (capture normally lands in ms).
@@ -1890,21 +1903,63 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
             }
         }
     }
-    // Phase-2b: bookkeeping only. Sidecar recording plus the owned submit
-    // happen at the first hooked Execute after evaluate (same queue, after
-    // the game batch), where color is complete and barriers use tracked
-    // states. Nothing here touches a command list.
-    const auto* colorInput = snapshot.Find(InputSemantic::Color);
-    ID3D12Resource* colorResource = (colorInput != nullptr) ? colorInput->resource : nullptr;
-    if (!EnsureOwnedCapture(device, colorResource, &copyError))
+    if (gameListCapture)
     {
-        LOG_WARN("DLSS-D frame receipt={} source_frame={} owned_capture_unavailable=1 reason={}",
-                 lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
-        lease->cancelled = true;
+        // Legacy game-list receipt path for quirked titles whose evaluate
+        // lists submit normally: record on the game list; its submission
+        // (or Reset) drives the owner through the pending handoff below.
+        Microsoft::WRL::ComPtr<ID3D12Device> receiptDevice;
+        if (lease->producer->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
+            FAILED(lease->producer->GetDevice(IID_PPV_ARGS(&receiptDevice))) ||
+            !lease->input.Initialize(receiptDevice.Get(), lease->tag.receiptId))
+        {
+            stagingLock.unlock();
+            return SkipUnsafe(handleId, "receipt_begin_failed", IdleSinceLastBoundaryMs(), snapshot.reset, extent,
+                              -1);
+        }
+        const bool copied = DlssdTranslatedSession::Evaluate(commandList, snapshot, nullptr, false, &copyError,
+                                                             DlssdRuntimeFrame_CopyOnCallerList);
+        // Append the receipt even after a partial copy failure: those recorded
+        // references still require submission completion or successful list Reset.
+        lease->copyFailed = !copied;
+        if (!copied)
+            LOG_WARN("DLSS-D frame receipt={} source_frame={} input_record_failed=1 reason={}",
+                     lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
+        if (!lease->input.Record(lease->producer.Get()))
+        {
+            lease->cancelled = true;
+            gRuntimePoisoned.store(true, std::memory_order_relaxed);
+            stagingLock.unlock();
+            LOG_ERROR("DLSS-D frame receipt record failed; retaining staging and HIP allocations");
+            return Decision::Rejected;
+        }
+        gPending = {};
+        gPending.op = OwnerOp::Evaluate;
+        gPending.snapshot = snapshot;
+        AddRefJob(gPending, State::Instance().currentCommandQueue);
+        gPending.handleId = handleId;
+        gPending.extent = extent;
+        gPending.lease = lease;
+        gHavePending = true;
     }
     else
     {
-        ArmInputTrackingLocked(snapshot);
+        // Phase-2b: bookkeeping only. Sidecar recording plus the owned submit
+        // happen at the first hooked Execute after evaluate (same queue, after
+        // the game batch), where color is complete and barriers use tracked
+        // states. Nothing here touches a command list.
+        const auto* colorInput = snapshot.Find(InputSemantic::Color);
+        ID3D12Resource* colorResource = (colorInput != nullptr) ? colorInput->resource : nullptr;
+        if (!EnsureOwnedCapture(device, colorResource, &copyError))
+        {
+            LOG_WARN("DLSS-D frame receipt={} source_frame={} owned_capture_unavailable=1 reason={}",
+                     lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
+            lease->cancelled = true;
+        }
+        else
+        {
+            ArmInputTrackingLocked(snapshot);
+        }
     }
     stagingLock.unlock();
 
@@ -1912,9 +1967,10 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     gHaveLastDispatch = true;
     void* const nativeProducer = ResolveNativeForMatch(lease->producer.Get());
     LOG_INFO("DLSS-D experimental backend handle={} evaluate prepared publish=0 evaluated={} dispatched={} "
-             "extent={} tid={} producer={:p} normalized={} nativeProducer={:p}",
+             "extent={} tid={} producer={:p} normalized={} nativeProducer={:p} capture={}",
              handleId, gEvaluated.load(), gDispatched.load(), extent != nullptr ? extent->name : "none",
-             GetCurrentThreadId(), (void*) lease->producer.Get(), producerNormalized ? 1 : 0, nativeProducer);
+             GetCurrentThreadId(), (void*) lease->producer.Get(), producerNormalized ? 1 : 0, nativeProducer,
+             gameListCapture ? "game" : "owned");
     FlushExperimentalLog();
     NoteEvaluateBoundary();
     return Decision::Unpublished;
@@ -2164,7 +2220,9 @@ void NoteResourceState(ID3D12Resource* resource, uint32_t stateAfter)
 // the session try-lock keeps hook callbacks non-blocking.
 void TryOwnedCaptureOnExecute(ID3D12CommandQueue* queue)
 {
-    if (queue == nullptr || !Enabled())
+    // Owned capture is the default vehicle; quirked game-list titles never
+    // reach this path (their receipts prove through BeforeSubmit instead).
+    if (queue == nullptr || !Enabled() || UseGameListCapture())
         return;
     if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return;

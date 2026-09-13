@@ -64,6 +64,11 @@ enum class GameQuirk : uint64_t
     IgnoreTagsWithoutHudlessForFG,
     ForceFGRenderSizeMVs,
     CreateSLOnThe2ndDevice,
+    // DLSS-D denoiser bridge: record translated inputs on the game's NGX
+    // evaluate list (legacy receipt path). Only helps titles whose evaluate
+    // lists actually submit; default owned-list capture otherwise. No title
+    // assigned yet (Cyberpunk 2077 needs owned capture).
+    DlssdGameListCapture,
     // Don't forget to add the new entry to printQuirks
     _
 };
