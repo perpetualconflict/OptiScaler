@@ -1003,9 +1003,9 @@ void hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists, ID3D1
                                                                         rendezvousToken == 0 ? plan : PublicationPlan {});
     if (!submitted)
         o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
-    // Phase-2b owned capture runs after the game batch on the same queue so
-    // previously submitted color writes precede our copies. Fail-closed.
-    DlssdExperimentalBackend::TryOwnedCaptureOnExecute(This);
+    // Remember the submitting DIRECT queue for Present-time owned capture.
+    // Capture itself moved to Present (all frame writes submitted by then).
+    DlssdExperimentalBackend::NoteDirectQueue(This);
     DlssdQueueRendezvous::AfterExecuteCommandLists(This, rendezvousToken);
 }
 

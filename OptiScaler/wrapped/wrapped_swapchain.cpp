@@ -653,6 +653,9 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present(UINT SyncInterval, UIN
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
+        // Phase-2c owned capture runs here: every frame write is submitted by
+        // now, so the owned color copy completes. Fail-closed, never blocks.
+        DlssdExperimentalBackend::TryOwnedCaptureOnPresent();
         result = LocalPresent(_real, SyncInterval, Flags, nullptr, _device, _handle, _uwp);
 
         // When Reflex can't be used to limit, sleep in present
@@ -1009,6 +1012,7 @@ HRESULT STDMETHODCALLTYPE WrappedIDXGISwapChain4::Present1(UINT SyncInterval, UI
 
     if ((Flags & DXGI_PRESENT_TEST) == 0)
     {
+        DlssdExperimentalBackend::TryOwnedCaptureOnPresent();
         result = LocalPresent(_real1, SyncInterval, Flags, pPresentParameters, _device, _handle, _uwp);
 
         // When Reflex can't be used to limit, sleep in present

@@ -315,6 +315,14 @@ struct FrameLease
     const AcceptedExtent* extent = nullptr;
     bool ownedCaptured = false;
     Clock::time_point createdAt {};
+    // Async completion (phase 2c): the hook submits, the owner waits. Fence,
+    // value, submit time, and probe refs travel on the lease so no game
+    // thread ever waits and context recreation cannot strand them.
+    Microsoft::WRL::ComPtr<ID3D12Fence> ownedFence;
+    UINT64 ownedFenceValue = 0;
+    Clock::time_point ownedSubmitAt {};
+    Microsoft::WRL::ComPtr<ID3D12Resource> ownedProbe;
+    UINT64 ownedProbeBytes = 0;
     bool split = false, cancelled = false, published = false, publicationSignalled = false;
     bool handoffActive = false;
     bool publicationCounted = false;
@@ -386,6 +394,7 @@ constexpr long long kCreateProgressQueryMs = 500;
 void AddRefSnapshot(InputSnapshot& snapshot);
 void ReleaseSnapshot(InputSnapshot& snapshot);
 void DisarmInputTracking();
+uint64_t Fnv1a64(const void* data, size_t bytes);
 void AddRefJob(OwnerJob& job, ID3D12CommandQueue* queue);
 void ReleaseJob(OwnerJob& job);
 void EnsureOwner();
@@ -1086,14 +1095,67 @@ void OwnerLoop()
             bool ok = false;
             if (job.lease)
             {
-                // Owned capture proves its inputs with its own fence before
-                // handoff, so the game-list receipt wait below does not apply.
-                // The legacy pending path still uses it.
+                // Async fence completion: the hook submitted without waiting;
+                // completion is a GPU fact polled here, so no game thread ever
+                // blocks. The legacy pending path still uses the receipt wait.
                 if (job.lease->ownedVerified)
                 {
-                    ok = !job.lease->cancelled && !job.lease->copyFailed;
-                    if (!ok)
-                        error = "owned capture invalid (copy failed or cancelled)";
+                    const auto deadline = Clock::now() + std::chrono::seconds(2);
+                    bool fenceOk = false;
+                    for (;;)
+                    {
+                        {
+                            std::lock_guard lock(gJobMutex);
+                            auto& lease = *job.lease;
+                            if (lease.cancelled)
+                                break;
+                            if (lease.ownedFence &&
+                                lease.ownedFence->GetCompletedValue() >= lease.ownedFenceValue)
+                            {
+                                fenceOk = true;
+                                break;
+                            }
+                        }
+                        if (Clock::now() >= deadline || gShutdown.load(std::memory_order_acquire))
+                            break;
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                    if (!fenceOk)
+                    {
+                        error = "owned capture fence never completed";
+                        ok = false;
+                    }
+                    else
+                    {
+                        void* mapped = nullptr;
+                        bool hashed = false;
+                        uint64_t hash = 0;
+                        long long captureMs = 0;
+                        {
+                            std::lock_guard lock(gJobMutex);
+                            auto& lease = *job.lease;
+                            if (!lease.cancelled && lease.ownedProbe &&
+                                SUCCEEDED(lease.ownedProbe->Map(0, nullptr, &mapped)) && mapped != nullptr)
+                            {
+                                hash = Fnv1a64(mapped, static_cast<size_t>(lease.ownedProbeBytes));
+                                lease.ownedProbe->Unmap(0, nullptr);
+                                hashed = true;
+                                captureMs =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                                                          lease.ownedSubmitAt)
+                                        .count();
+                            }
+                        }
+                        if (hashed)
+                        {
+                            LOG_INFO("DLSS-D frame receipt={} source_frame={} owned_capture=1 hash={:016x} ms={}",
+                                     job.lease->tag.receiptId, job.lease->tag.sourceFrame, hash, captureMs);
+                            FlushExperimentalLog();
+                        }
+                        ok = hashed && !job.lease->cancelled && !job.lease->copyFailed;
+                        if (!ok && error == nullptr)
+                            error = "owned capture invalid (copy failed, cancelled, or map failed)";
+                    }
                 }
                 else
                 {
@@ -1621,19 +1683,12 @@ bool EnsureOwnedCapture(ID3D12Device* device, ID3D12Resource* color, const char*
 // Closes the private list, submits it, waits bounded for the fence, and
 // hashes the color probe. States mirror the sidecar's Streamline 2.12
 // evaluate assumption (non-output inputs are PIXEL_SHADER_RESOURCE).
-bool SubmitOwnedProbe(ID3D12Resource* color, ID3D12CommandQueue* execQueue, uint64_t& hash, long long& elapsedMs,
-                      const char** error)
+bool SubmitOwnedProbe(ID3D12Resource* color, ID3D12CommandQueue* execQueue, const char** error)
 {
-    const auto enter = Clock::now();
-    auto finishMs = [&]
-    {
-        elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - enter).count();
-    };
     if (color == nullptr || execQueue == nullptr)
     {
         if (error)
             *error = "owned capture submitted without color or queue";
-        finishMs();
         return false;
     }
     // Barrier states come from game-observed transitions (seeded with the
@@ -1670,36 +1725,22 @@ bool SubmitOwnedProbe(ID3D12Resource* color, ID3D12CommandQueue* execQueue, uint
         if (error)
             *error = "owned capture list close failed";
         gOwnedCapture.listOpen = false;
-        finishMs();
         return false;
     }
     gOwnedCapture.listOpen = false;
     ID3D12CommandList* lists[] = { gOwnedCapture.list.Get() };
     // Same queue the game batch just ran on: our copies execute strictly
     // after all previously submitted game work. Re-enters the hooked
-    // Execute below, which skips handling via the session try-lock.
+    // Execute below, which skips handling via the session try-lock. No CPU
+    // wait here: completion is polled on the owner thread (async).
     execQueue->ExecuteCommandLists(1, lists);
     const UINT64 value = ++gOwnedCapture.fenceValue;
-    if (FAILED(execQueue->Signal(gOwnedCapture.fence.Get(), value)) ||
-        FAILED(gOwnedCapture.fence->SetEventOnCompletion(value, gOwnedCapture.event)) ||
-        WaitForSingleObject(gOwnedCapture.event, 250) != WAIT_OBJECT_0)
+    if (FAILED(execQueue->Signal(gOwnedCapture.fence.Get(), value)))
     {
         if (error)
-            *error = "owned capture fence wait timed out";
-        finishMs();
+            *error = "owned capture signal failed";
         return false;
     }
-    void* mapped = nullptr;
-    if (FAILED(gOwnedCapture.probe->Map(0, nullptr, &mapped)) || mapped == nullptr)
-    {
-        if (error)
-            *error = "owned capture probe map failed";
-        finishMs();
-        return false;
-    }
-    hash = Fnv1a64(mapped, static_cast<size_t>(gOwnedCapture.probeBytes));
-    gOwnedCapture.probe->Unmap(0, nullptr);
-    finishMs();
     return true;
 }
 
@@ -1978,7 +2019,6 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
 
 // Phase-2b Execute-time capture (definition lives at DlssdExperimentalBackend
 // scope below; declared here for RunPrepare-adjacent callers).
-void TryOwnedCaptureOnExecute(ID3D12CommandQueue* queue);
 } // namespace
 
 bool Enabled()
@@ -2211,20 +2251,44 @@ void NoteResourceState(ID3D12Resource* resource, uint32_t stateAfter)
     gInputStates[resource] = static_cast<D3D12_RESOURCE_STATES>(stateAfter);
 }
 
-// Phase-2b Execute-time capture. Called from the hooked ExecuteCommandLists
-// AFTER the game batch runs, on the submitting DIRECT queue: every previously
-// submitted game write precedes us on the same queue, so color is complete.
-// Records sidecar copies plus the color probe onto the owned list with
-// barrier-observed states, submits on This, fence-waits bounded, hashes, and
-// hands verified leases to the owner single-flight. Fail-closed throughout;
-// the session try-lock keeps hook callbacks non-blocking.
-void TryOwnedCaptureOnExecute(ID3D12CommandQueue* queue)
+// Last-seen submitting DIRECT queue for Present-time capture. Written from
+// the Execute hook, read from the Present hook; dedicated leaf mutex so
+// neither hook path takes the session lock for this.
+std::mutex gLastQueueMutex;
+Microsoft::WRL::ComPtr<ID3D12CommandQueue> gLastDirectQueue {};
+std::atomic<uint32_t> gSubmits { 0 };
+
+void NoteDirectQueue(ID3D12CommandQueue* queue)
+{
+    if (queue == nullptr)
+        return;
+    if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return;
+    std::lock_guard lock(gLastQueueMutex);
+    if (gLastDirectQueue.Get() != queue)
+        gLastDirectQueue = queue;
+}
+
+// Phase-2c Present-time capture. Called from the hooked Present AFTER the
+// frame's batches are submitted, on the stored DIRECT queue: every frame
+// write precedes us on the same queue, so color is complete. Records sidecar
+// copies plus the color probe onto the owned list, submits, signals, and
+// hands verified leases to the owner single-flight WITHOUT waiting: the
+// owner polls the fence (async completion), so no game thread ever blocks.
+// Fail-closed throughout; the session try-lock keeps hook callbacks
+// non-blocking.
+void TryOwnedCaptureOnPresent()
 {
     // Owned capture is the default vehicle; quirked game-list titles never
     // reach this path (their receipts prove through BeforeSubmit instead).
-    if (queue == nullptr || !Enabled() || UseGameListCapture())
+    if (!Enabled() || UseGameListCapture())
         return;
-    if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    {
+        std::lock_guard lock(gLastQueueMutex);
+        queue = gLastDirectQueue;
+    }
+    if (queue == nullptr)
         return;
     std::unique_lock lock(gJobMutex, std::try_to_lock);
     if (!lock.owns_lock() || gShutdown || !gFrameLease)
@@ -2248,13 +2312,16 @@ void TryOwnedCaptureOnExecute(ID3D12CommandQueue* queue)
     const auto* colorInput = lease->snapshot.Find(InputSemantic::Color);
     ID3D12Resource* colorResource = (colorInput != nullptr) ? colorInput->resource : nullptr;
     const char* captureError = nullptr;
-    uint64_t captureHash = 0;
-    long long captureMs = 0;
-    const bool submitted = SubmitOwnedProbe(colorResource, queue, captureHash, captureMs, &captureError);
+    const bool submitted = SubmitOwnedProbe(colorResource, queue.Get(), &captureError);
     if (submitted)
     {
-        LOG_INFO("DLSS-D frame receipt={} source_frame={} owned_capture=1 hash={:016x} ms={}",
-                 lease->tag.receiptId, lease->tag.sourceFrame, captureHash, captureMs);
+        const auto submitTotal = gSubmits.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (submitTotal <= 3 || (submitTotal % 120) == 0)
+        {
+            LOG_INFO("DLSS-D frame receipt={} source_frame={} owned submitted total={} tid={}",
+                     lease->tag.receiptId, lease->tag.sourceFrame, submitTotal, GetCurrentThreadId());
+            FlushExperimentalLog();
+        }
     }
     else
     {
