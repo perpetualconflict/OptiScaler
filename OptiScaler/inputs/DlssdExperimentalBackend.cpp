@@ -146,6 +146,7 @@ bool FindProducerLocked(void* native, uint64_t currentReceipt, uint64_t& hitRece
     return false;
 }
 std::atomic<uint32_t> gLateHits { 0 };
+std::atomic<uint32_t> gExecuteBusySkips { 0 };
 // Reverse lookup (2026-09-13): the producer ring never hits, so remember
 // what the game actually submits and test each new producer against it. A
 // hit means pool reuse with deep lag (fix = lifetime); permanent silence
@@ -2124,7 +2125,22 @@ bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
     bool split = false;
     UINT prefixCount = count;
     {
-        std::lock_guard lock(gJobMutex);
+        // Hook callbacks must never block (2026-09-13 EDEADLK: our own
+        // SubmitOwnedProbe re-entered this hook while holding stagingLock).
+        // A skipped Execute runs the original submission untouched; receipt
+        // matching retries on a later Execute with unchanged phase.
+        std::unique_lock lock(gJobMutex, std::try_to_lock);
+        if (!lock.owns_lock())
+        {
+            const auto total = gExecuteBusySkips.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (total <= 3 || (total % 120) == 0)
+            {
+                LOG_INFO("DLSS-D Execute hook skipped busy session lock total={} tid={}", total,
+                         GetCurrentThreadId());
+                FlushExperimentalLog();
+            }
+            return false;
+        }
         DrainDeferredResetLocked();
         if (!gHavePending || !gPending.lease || gShutdown || gHaveJob || gOwnerBusy.load())
             return false;
