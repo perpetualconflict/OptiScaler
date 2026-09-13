@@ -28,6 +28,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace DlssdExperimentalBackend
@@ -306,6 +308,13 @@ struct FrameLease
     uint32_t outputX = 0, outputY = 0, width = 0, height = 0;
     uint32_t readyState = 0;
     bool copyFailed = false, ownerDone = false, ownerOk = false, ownedVerified = false;
+    // Phase-2b: inputs captured at first Execute after evaluate, not during
+    // it. Snapshot held with AddRef/Release discipline (raw COM pointers);
+    // released in RetireFrameLeaseLocked before the lease resets.
+    InputSnapshot snapshot;
+    const AcceptedExtent* extent = nullptr;
+    bool ownedCaptured = false;
+    Clock::time_point createdAt {};
     bool split = false, cancelled = false, published = false, publicationSignalled = false;
     bool handoffActive = false;
     bool publicationCounted = false;
@@ -376,6 +385,7 @@ constexpr long long kCreateProgressQueryMs = 500;
 
 void AddRefSnapshot(InputSnapshot& snapshot);
 void ReleaseSnapshot(InputSnapshot& snapshot);
+void DisarmInputTracking();
 void AddRefJob(OwnerJob& job, ID3D12CommandQueue* queue);
 void ReleaseJob(OwnerJob& job);
 void EnsureOwner();
@@ -569,6 +579,8 @@ bool RetireFrameLeaseLocked()
         return false;
     LOG_INFO("DLSS-D frame receipt={} source_frame={} retired=1 published={}",
              lease.tag.receiptId, lease.tag.sourceFrame, lease.published ? 1 : 0);
+    ReleaseSnapshot(lease.snapshot);
+    DisarmInputTracking();
     gReceiptProducer.store(nullptr, std::memory_order_release);
     gFrameLease.reset();
     return true;
@@ -1390,6 +1402,55 @@ struct StagingLock
     }
 };
 
+// Phase-2b input-state tracking (2026-09-13): color is still being rendered
+// at evaluate time, so evaluate-time copies catch partial work. Capture
+// moves to the first hooked Execute after evaluate, on the same queue right
+// after the game batch — but barriers recorded there need the CURRENT state,
+// not the evaluate-time hint. Observe game barriers for lease inputs here;
+// the map is keyed by pointer and re-armed per lease, so reuse is safe.
+// Lock order: leaf (gInputStateMutex alone) or gJobMutex -> gInputStateMutex;
+// never the reverse, and hook callbacks never block on gJobMutex.
+std::mutex gInputStateMutex;
+std::atomic<bool> gTrackingInputs { false };
+std::unordered_set<ID3D12Resource*> gTrackedInputs {};
+std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> gInputStates {};
+
+void NoteResourceState(ID3D12Resource* resource, uint32_t stateAfter);
+
+D3D12_RESOURCE_STATES TrackedStateFor(ID3D12Resource* resource, D3D12_RESOURCE_STATES fallback)
+{
+    std::lock_guard lock(gInputStateMutex);
+    const auto it = gInputStates.find(resource);
+    return it != gInputStates.end() ? it->second : fallback;
+}
+
+// Caller holds gJobMutex. Registers the lease inputs and seeds canonical
+// Streamline 2.12 evaluate states (non-output inputs are TEXTURE_READ).
+void ArmInputTrackingLocked(const InputSnapshot& snapshot)
+{
+    std::lock_guard lock(gInputStateMutex);
+    gTrackedInputs.clear();
+    gInputStates.clear();
+    for (const auto& input : snapshot.resources)
+    {
+        if (input.resource == nullptr || input.definition == nullptr)
+            continue;
+        gTrackedInputs.insert(input.resource);
+        const bool isOutput = input.definition->semantic == InputSemantic::Output;
+        gInputStates[input.resource] = isOutput ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                                                : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    gTrackingInputs.store(true, std::memory_order_release);
+}
+
+void DisarmInputTracking()
+{
+    gTrackingInputs.store(false, std::memory_order_release);
+    std::lock_guard lock(gInputStateMutex);
+    gTrackedInputs.clear();
+    gInputStates.clear();
+}
+
 // Phase-1 owned capture (2026-09-13): the NGX-time game list is never
 // submitted, so input copies recorded onto it never execute. Record sidecar
 // input copies onto a private list instead, submit it on a private queue,
@@ -1549,25 +1610,30 @@ bool EnsureOwnedCapture(ID3D12Device* device, ID3D12Resource* color, const char*
 // Closes the private list, submits it, waits bounded for the fence, and
 // hashes the color probe. States mirror the sidecar's Streamline 2.12
 // evaluate assumption (non-output inputs are PIXEL_SHADER_RESOURCE).
-bool SubmitOwnedProbe(ID3D12Resource* color, uint64_t& hash, long long& elapsedMs, const char** error)
+bool SubmitOwnedProbe(ID3D12Resource* color, ID3D12CommandQueue* execQueue, uint64_t& hash, long long& elapsedMs,
+                      const char** error)
 {
     const auto enter = Clock::now();
     auto finishMs = [&]
     {
         elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - enter).count();
     };
-    if (color == nullptr)
+    if (color == nullptr || execQueue == nullptr)
     {
         if (error)
-            *error = "owned capture submitted without color";
+            *error = "owned capture submitted without color or queue";
         finishMs();
         return false;
     }
+    // Barrier states come from game-observed transitions (seeded with the
+    // Streamline evaluate hint), not the evaluate-time assumption: by the
+    // time this runs the game has moved color since tagging.
+    const D3D12_RESOURCE_STATES tracked = TrackedStateFor(color, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     D3D12_RESOURCE_BARRIER toCopy {};
     toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     toCopy.Transition.pResource = color;
     toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    toCopy.Transition.StateBefore = tracked;
     toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     gOwnedCapture.list->ResourceBarrier(1, &toCopy);
     D3D12_TEXTURE_COPY_LOCATION dst {};
@@ -1598,9 +1664,12 @@ bool SubmitOwnedProbe(ID3D12Resource* color, uint64_t& hash, long long& elapsedM
     }
     gOwnedCapture.listOpen = false;
     ID3D12CommandList* lists[] = { gOwnedCapture.list.Get() };
-    gOwnedCapture.queue->ExecuteCommandLists(1, lists);
+    // Same queue the game batch just ran on: our copies execute strictly
+    // after all previously submitted game work. Re-enters the hooked
+    // Execute below, which skips handling via the session try-lock.
+    execQueue->ExecuteCommandLists(1, lists);
     const UINT64 value = ++gOwnedCapture.fenceValue;
-    if (FAILED(gOwnedCapture.queue->Signal(gOwnedCapture.fence.Get(), value)) ||
+    if (FAILED(execQueue->Signal(gOwnedCapture.fence.Get(), value)) ||
         FAILED(gOwnedCapture.fence->SetEventOnCompletion(value, gOwnedCapture.event)) ||
         WaitForSingleObject(gOwnedCapture.event, 250) != WAIT_OBJECT_0)
     {
@@ -1739,6 +1808,21 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
         return SkipUnsafe(handleId, "receipt_hooks_unavailable", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
     StagingLock stagingLock;
     DrainDeferredResetLocked();
+    if (gFrameLease && !gFrameLease->ownedCaptured && !gFrameLease->cancelled)
+    {
+        // Wedge guard: an uncaptured lease with no Execute within 1 s fails
+        // closed so the bridge keeps flowing (capture normally lands in ms).
+        const auto ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() -
+                                                                                 gFrameLease->createdAt)
+                               .count();
+        if (ageMs > 1000)
+        {
+            LOG_WARN("DLSS-D frame receipt={} uncaptured lease timeout age_ms={} tid={}",
+                     gFrameLease->tag.receiptId, ageMs, GetCurrentThreadId());
+            FlushExperimentalLog();
+            gFrameLease->cancelled = true;
+        }
+    }
     if (gShutdown || gHavePending || gHaveJob || gOwnerBusy.load(std::memory_order_acquire) ||
         !RetireFrameLeaseLocked())
     {
@@ -1750,6 +1834,10 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     lease->tag.sourceFrame = snapshot.frameIndex;
     lease->tag.handleId = handleId;
     lease->tag.resetRequested = snapshot.reset;
+    lease->createdAt = Clock::now();
+    lease->snapshot = snapshot;
+    AddRefSnapshot(lease->snapshot);
+    lease->extent = extent;
     lease->width = snapshot.outputWidth;
     lease->height = snapshot.outputHeight;
     lease->producer = commandList;
@@ -1802,74 +1890,21 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
             }
         }
     }
-    // Phase-1 owned capture: record sidecar input copies onto the private
-    // list (the game list is never submitted, so copies there never run).
+    // Phase-2b: bookkeeping only. Sidecar recording plus the owned submit
+    // happen at the first hooked Execute after evaluate (same queue, after
+    // the game batch), where color is complete and barriers use tracked
+    // states. Nothing here touches a command list.
     const auto* colorInput = snapshot.Find(InputSemantic::Color);
     ID3D12Resource* colorResource = (colorInput != nullptr) ? colorInput->resource : nullptr;
-    ID3D12GraphicsCommandList* ownedList = nullptr;
-    if (EnsureOwnedCapture(device, colorResource, &copyError))
-        ownedList = gOwnedCapture.list.Get();
-    else
+    if (!EnsureOwnedCapture(device, colorResource, &copyError))
+    {
         LOG_WARN("DLSS-D frame receipt={} source_frame={} owned_capture_unavailable=1 reason={}",
                  lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
-    const bool copied = DlssdTranslatedSession::Evaluate(ownedList != nullptr ? ownedList : commandList, snapshot,
-                                                         nullptr, false, &copyError, DlssdRuntimeFrame_CopyOnCallerList);
-    // Append the receipt even after a partial copy failure: those recorded
-    // references still require submission completion or successful list Reset.
-    lease->copyFailed = !copied;
-    if (!copied)
-        LOG_WARN("DLSS-D frame receipt={} source_frame={} input_record_failed=1 reason={}",
-                 lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
-
+        lease->cancelled = true;
+    }
+    else
     {
-        // Phase-2 owner handoff, single-flight: the owned fence above is the
-        // submission proof, so hand the lease straight to the owner. If the
-        // owner is busy, drop this lease fail-closed and try next frame.
-        // The game picture stays on fallback; nothing publishes yet.
-        const char* captureError = nullptr;
-        uint64_t captureHash = 0;
-        long long captureMs = 0;
-        bool submitted = ownedList != nullptr &&
-            SubmitOwnedProbe(colorResource, captureHash, captureMs, &captureError);
-        if (submitted)
-        {
-            LOG_INFO("DLSS-D frame receipt={} source_frame={} owned_capture=1 hash={:016x} ms={}",
-                     lease->tag.receiptId, lease->tag.sourceFrame, captureHash, captureMs);
-        }
-        else
-        {
-            LOG_WARN("DLSS-D frame receipt={} source_frame={} owned_capture=0 reason={}",
-                     lease->tag.receiptId, lease->tag.sourceFrame,
-                     captureError != nullptr ? captureError : "unknown");
-        }
-        FlushExperimentalLog();
-        lease->ownedVerified = submitted && copied && !lease->copyFailed;
-        if (lease->ownedVerified && !gHaveJob && !gOwnerBusy.load(std::memory_order_acquire) && !gShutdown)
-        {
-            gJob = {};
-            gJob.op = OwnerOp::Evaluate;
-            gJob.snapshot = snapshot;
-            AddRefJob(gJob, State::Instance().currentCommandQueue);
-            gJob.handleId = handleId;
-            gJob.extent = extent;
-            gJob.lease = lease;
-            gHaveJob = true;
-            gJobCv.notify_one();
-        }
-        else
-        {
-            if (lease->ownedVerified)
-            {
-                const auto total = gOwnerBusyDrops.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (total <= 3 || (total % 120) == 0)
-                {
-                    LOG_INFO("DLSS-D frame receipt={} owner busy, dropping owned lease total={} tid={}",
-                             lease->tag.receiptId, total, GetCurrentThreadId());
-                    FlushExperimentalLog();
-                }
-            }
-            lease->cancelled = true;
-        }
+        ArmInputTrackingLocked(snapshot);
     }
     stagingLock.unlock();
 
@@ -1884,6 +1919,10 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     NoteEvaluateBoundary();
     return Decision::Unpublished;
 }
+
+// Phase-2b Execute-time capture (definition lives at DlssdExperimentalBackend
+// scope below; declared here for RunPrepare-adjacent callers).
+void TryOwnedCaptureOnExecute(ID3D12CommandQueue* queue);
 } // namespace
 
 bool Enabled()
@@ -2104,6 +2143,95 @@ void NotifyFrameSubmitted()
 {
     // Present is not evidence that the staging command list executed.
     // Only the exact ExecuteCommandLists receipt schedules the owner.
+}
+
+void NoteResourceState(ID3D12Resource* resource, uint32_t stateAfter)
+{
+    if (resource == nullptr || !gTrackingInputs.load(std::memory_order_acquire))
+        return;
+    std::lock_guard lock(gInputStateMutex);
+    if (gTrackedInputs.find(resource) == gTrackedInputs.end())
+        return;
+    gInputStates[resource] = static_cast<D3D12_RESOURCE_STATES>(stateAfter);
+}
+
+// Phase-2b Execute-time capture. Called from the hooked ExecuteCommandLists
+// AFTER the game batch runs, on the submitting DIRECT queue: every previously
+// submitted game write precedes us on the same queue, so color is complete.
+// Records sidecar copies plus the color probe onto the owned list with
+// barrier-observed states, submits on This, fence-waits bounded, hashes, and
+// hands verified leases to the owner single-flight. Fail-closed throughout;
+// the session try-lock keeps hook callbacks non-blocking.
+void TryOwnedCaptureOnExecute(ID3D12CommandQueue* queue)
+{
+    if (queue == nullptr || !Enabled())
+        return;
+    if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
+        return;
+    std::unique_lock lock(gJobMutex, std::try_to_lock);
+    if (!lock.owns_lock() || gShutdown || !gFrameLease)
+        return;
+    auto lease = gFrameLease;
+    if (lease->ownedCaptured || lease->cancelled || !DlssdTranslatedSession::IsAttached())
+        return;
+    if (gOwnedCapture.list.Get() == nullptr || !gOwnedCapture.listOpen)
+        return;
+    const char* copyError = nullptr;
+    const bool copied = DlssdTranslatedSession::Evaluate(gOwnedCapture.list.Get(), lease->snapshot, nullptr, false,
+                                                         &copyError, DlssdRuntimeFrame_CopyOnCallerList);
+    lease->copyFailed = !copied;
+    if (!copied)
+    {
+        LOG_WARN("DLSS-D frame receipt={} source_frame={} input_record_failed=1 reason={}",
+                 lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
+        lease->cancelled = true;
+        return;
+    }
+    const auto* colorInput = lease->snapshot.Find(InputSemantic::Color);
+    ID3D12Resource* colorResource = (colorInput != nullptr) ? colorInput->resource : nullptr;
+    const char* captureError = nullptr;
+    uint64_t captureHash = 0;
+    long long captureMs = 0;
+    const bool submitted = SubmitOwnedProbe(colorResource, queue, captureHash, captureMs, &captureError);
+    if (submitted)
+    {
+        LOG_INFO("DLSS-D frame receipt={} source_frame={} owned_capture=1 hash={:016x} ms={}",
+                 lease->tag.receiptId, lease->tag.sourceFrame, captureHash, captureMs);
+    }
+    else
+    {
+        LOG_WARN("DLSS-D frame receipt={} source_frame={} owned_capture=0 reason={}",
+                 lease->tag.receiptId, lease->tag.sourceFrame, captureError != nullptr ? captureError : "unknown");
+    }
+    FlushExperimentalLog();
+    lease->ownedCaptured = true;
+    lease->ownedVerified = submitted && copied && !lease->copyFailed;
+    if (lease->ownedVerified && !gHaveJob && !gOwnerBusy.load(std::memory_order_acquire))
+    {
+        gJob = {};
+        gJob.op = OwnerOp::Evaluate;
+        gJob.snapshot = lease->snapshot;
+        AddRefJob(gJob, State::Instance().currentCommandQueue);
+        gJob.handleId = lease->tag.handleId;
+        gJob.extent = lease->extent;
+        gJob.lease = lease;
+        gHaveJob = true;
+        gJobCv.notify_one();
+    }
+    else
+    {
+        if (lease->ownedVerified)
+        {
+            const auto total = gOwnerBusyDrops.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (total <= 3 || (total % 120) == 0)
+            {
+                LOG_INFO("DLSS-D frame receipt={} owner busy, dropping owned lease total={} tid={}",
+                         lease->tag.receiptId, total, GetCurrentThreadId());
+                FlushExperimentalLog();
+            }
+        }
+        lease->cancelled = true;
+    }
 }
 
 void NotifyCommandListReset(ID3D12GraphicsCommandList* list)

@@ -5,6 +5,7 @@
 struct ID3D12GraphicsCommandList;
 struct ID3D12CommandQueue;
 struct ID3D12CommandList;
+struct ID3D12Resource;
 struct NVSDK_NGX_Parameter;
 namespace DlssdOutputHazardTrace { struct PublicationPlan; }
 
@@ -46,5 +47,12 @@ using ExecuteLists = void (*)(ID3D12CommandQueue*, unsigned int, ID3D12CommandLi
 bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count, ID3D12CommandList* const* lists,
                                ExecuteLists execute, const DlssdOutputHazardTrace::PublicationPlan& plan);
 void NotifyCommandListReset(ID3D12GraphicsCommandList* list);
+// Barrier-observed input states for Execute-time capture (resource states
+// are uint32_t D3D12_RESOURCE_STATES to keep this header API-light).
+void NoteResourceState(ID3D12Resource* resource, uint32_t stateAfter);
+// First hooked Execute after a lease: record sidecar copies plus the color
+// probe onto the owned list and submit them on the submitting queue, then
+// hand verified leases to the owner. Fail-closed; never blocks the caller.
+void TryOwnedCaptureOnExecute(ID3D12CommandQueue* queue);
 void Release(uint32_t handleId);
 } // namespace DlssdExperimentalBackend

@@ -1003,6 +1003,9 @@ void hkExecuteCommandLists(ID3D12CommandQueue* This, UINT NumCommandLists, ID3D1
                                                                         rendezvousToken == 0 ? plan : PublicationPlan {});
     if (!submitted)
         o_ExecuteCommandLists(This, NumCommandLists, ppCommandLists);
+    // Phase-2b owned capture runs after the game batch on the same queue so
+    // previously submitted color writes precede our copies. Fail-closed.
+    DlssdExperimentalBackend::TryOwnedCaptureOnExecute(This);
     DlssdQueueRendezvous::AfterExecuteCommandLists(This, rendezvousToken);
 }
 
@@ -1012,6 +1015,22 @@ void hkResourceBarrier(ID3D12GraphicsCommandList* This, UINT NumBarriers, const 
     {
         std::lock_guard lock(StateMutex);
         ObserveBarrierLocked(This, NumBarriers, pBarriers);
+    }
+    // Feed Execute-time capture barrier states (backend filters unregistered
+    // resources lock-free first; solo cost is one extra call per barrier).
+    if (pBarriers != nullptr)
+    {
+        for (UINT i = 0; i < NumBarriers; ++i)
+        {
+            const auto& barrier = pBarriers[i];
+            if (barrier.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                !(barrier.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY) &&
+                barrier.Transition.pResource != nullptr)
+            {
+                DlssdExperimentalBackend::NoteResourceState(
+                    barrier.Transition.pResource, static_cast<uint32_t>(barrier.Transition.StateAfter));
+            }
+        }
     }
     o_ResourceBarrier(This, NumBarriers, pBarriers);
 }
