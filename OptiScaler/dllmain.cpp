@@ -1969,9 +1969,41 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         if (!State::Instance().NVNGX_DLSS_Path.has_value())
             State::Instance().NVNGX_DLSS_Path = Util::FindFilePath(exePath, "nvngx_dlss.dll");
 
-        State::Instance().NVNGX_DLSSD_Path = Util::FindFilePath(optiDllPath, "nvngx_dlssd.dll");
+        // Sidecar-private DLSS-D copy (2026-09-14): OptiScaler may stage an exact
+        // signed nvngx_dlssd.dll under OptiScaler/dlssd_runtime for translation.
+        // A staged private copy wins over ambient game copies (deterministic;
+        // immune to vendor updates swapping versions under us). It is never on
+        // any engine load path: only our code below loads it by explicit full
+        // path, so the game and Streamline can neither see nor load it.
+        {
+            const std::filesystem::path privateCopy = std::filesystem::path(optiDllPath) / L"OptiScaler" /
+                L"dlssd_runtime" / L"nvngx_dlssd.dll";
+            if (std::filesystem::exists(privateCopy) && std::filesystem::is_regular_file(privateCopy))
+            {
+                State::Instance().NVNGX_DLSSD_Path = privateCopy;
+                LOG_INFO(L"nvngx_dlssd.dll using sidecar-private copy at {}", privateCopy.wstring());
+            }
+        }
+        if (!State::Instance().NVNGX_DLSSD_Path.has_value())
+            State::Instance().NVNGX_DLSSD_Path = Util::FindFilePath(optiDllPath, "nvngx_dlssd.dll");
         if (!State::Instance().NVNGX_DLSSD_Path.has_value())
             State::Instance().NVNGX_DLSSD_Path = Util::FindFilePath(exePath, "nvngx_dlssd.dll");
+        if (!State::Instance().NVNGX_DLSSD_Path.has_value())
+        {
+            // Loaded-module fallback: the engine may already have loaded DLSS-D
+            // from an exotic (e.g. UE plugin) directory. Fully generic: no
+            // layout knowledge, only whatever is actually mapped.
+            if (const HMODULE loaded = GetModuleHandleW(L"nvngx_dlssd.dll"))
+            {
+                wchar_t image[MAX_PATH]{};
+                if (GetModuleFileNameW(loaded, image, MAX_PATH) != 0 && std::filesystem::exists(image))
+                {
+                    State::Instance().NVNGX_DLSSD_Path = image;
+                    LOG_INFO(L"nvngx_dlssd.dll resolved from loaded module at {}",
+                             State::Instance().NVNGX_DLSSD_Path.value());
+                }
+            }
+        }
 
         State::Instance().NVNGX_DLSSG_Path = Util::FindFilePath(optiDllPath, "nvngx_dlssg.dll");
         if (!State::Instance().NVNGX_DLSSG_Path.has_value())
