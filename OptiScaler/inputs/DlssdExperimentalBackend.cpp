@@ -67,6 +67,7 @@ std::atomic<uint32_t> gPublished { 0 };
 // Starvation diagnostics (2026-09-12): why leases never reach Submitted.
 // Counters only; call sites throttle the log lines. No behavior change.
 std::atomic<uint32_t> gDeferredResetApplied { 0 };
+std::atomic<uint32_t> gDeferredResetIgnoredSelf { 0 };
 std::atomic<uint32_t> gResetCancels { 0 };
 std::atomic<uint32_t> gSubmitMismatches { 0 };
 std::atomic<uint32_t> gSubmitMatches { 0 };
@@ -1700,6 +1701,23 @@ void NotifyCommandListReset(ID3D12GraphicsCommandList* list)
     // so never block: defer the observation for the next lock holder.
     if (list != gReceiptProducer.load(std::memory_order_acquire))
         return;
+    // 2026-09-13 game log: every sampled deferred reset had self=1 with zero
+    // submission matches/mismatches (8015 prepared, 8015 retired flags=5).
+    // A Reset observed while this thread holds the staging lock precedes the
+    // Record Copy onto the freshly-reset list, so the Record supersedes it.
+    // Deferring it cancels valid work before Execute ever runs. Drop self
+    // observations; genuine pool reuse arrives outside staging (self=0).
+    if (tStagingDepth > 0)
+    {
+        const auto total = gDeferredResetIgnoredSelf.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (total <= 3 || (total % 120) == 0)
+        {
+            LOG_INFO("DLSS-D deferred producer reset ignored self total={} tid={}", total,
+                     GetCurrentThreadId());
+            FlushExperimentalLog();
+        }
+        return;
+    }
     std::unique_lock lock(gJobMutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
