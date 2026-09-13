@@ -2251,11 +2251,20 @@ void NoteResourceState(ID3D12Resource* resource, uint32_t stateAfter)
     gInputStates[resource] = static_cast<D3D12_RESOURCE_STATES>(stateAfter);
 }
 
-// Last-seen submitting DIRECT queue for Present-time capture. Written from
-// the Execute hook, read from the Present hook; dedicated leaf mutex so
+// Submitting DIRECT queues scored by activity (2026-09-13): the single
+// last-seen queue proved unreliable (owned fences never completed - likely
+// an SL aux queue idle outside attach/telemetry bursts), so Present-time
+// capture submits on the busiest recently-active queue. Stale queues lose
+// automatically, which also self-heals a bad pick. Dedicated leaf mutex so
 // neither hook path takes the session lock for this.
+struct QueueScore
+{
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    uint64_t submits = 0;
+    uint64_t lastTickMs = 0;
+};
 std::mutex gLastQueueMutex;
-Microsoft::WRL::ComPtr<ID3D12CommandQueue> gLastDirectQueue {};
+std::array<QueueScore, 4> gQueueScores {};
 std::atomic<uint32_t> gSubmits { 0 };
 
 void NoteDirectQueue(ID3D12CommandQueue* queue)
@@ -2264,9 +2273,71 @@ void NoteDirectQueue(ID3D12CommandQueue* queue)
         return;
     if (queue->GetDesc().Type != D3D12_COMMAND_LIST_TYPE_DIRECT)
         return;
+    const uint64_t nowMs = GetTickCount64();
     std::lock_guard lock(gLastQueueMutex);
-    if (gLastDirectQueue.Get() != queue)
-        gLastDirectQueue = queue;
+    QueueScore* slot = nullptr;
+    QueueScore* oldest = &gQueueScores[0];
+    for (auto& entry : gQueueScores)
+    {
+        if (entry.queue.Get() == queue)
+        {
+            slot = &entry;
+            break;
+        }
+        if (entry.queue == nullptr)
+        {
+            slot = &entry;
+            break;
+        }
+        if (entry.lastTickMs < oldest->lastTickMs)
+            oldest = &entry;
+    }
+    if (slot == nullptr)
+    {
+        slot = oldest;
+        slot->queue.Reset();
+        slot->submits = 0;
+    }
+    slot->queue = queue;
+    ++slot->submits;
+    slot->lastTickMs = nowMs;
+}
+
+// Busiest queue seen within the freshness window; falls back to busiest
+// overall so a quiet tail never strands capture. Empty when nothing seen.
+Microsoft::WRL::ComPtr<ID3D12CommandQueue> PickDirectQueue(uint64_t& scoreOut)
+{
+    const uint64_t nowMs = GetTickCount64();
+    std::lock_guard lock(gLastQueueMutex);
+    QueueScore* best = nullptr;
+    for (auto& entry : gQueueScores)
+    {
+        if (entry.queue == nullptr || entry.submits == 0)
+            continue;
+        if (best == nullptr)
+        {
+            best = &entry;
+            continue;
+        }
+        const bool entryFresh = nowMs - entry.lastTickMs < 2000;
+        const bool bestFresh = nowMs - best->lastTickMs < 2000;
+        if (entryFresh != bestFresh)
+        {
+            if (entryFresh)
+                best = &entry;
+        }
+        else if (entry.submits > best->submits)
+        {
+            best = &entry;
+        }
+    }
+    if (best == nullptr)
+    {
+        scoreOut = 0;
+        return nullptr;
+    }
+    scoreOut = best->submits;
+    return best->queue;
 }
 
 // Phase-2c Present-time capture. Called from the hooked Present AFTER the
@@ -2284,10 +2355,8 @@ void TryOwnedCaptureOnPresent()
     if (!Enabled() || UseGameListCapture())
         return;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
-    {
-        std::lock_guard lock(gLastQueueMutex);
-        queue = gLastDirectQueue;
-    }
+    uint64_t queueScore = 0;
+    queue = PickDirectQueue(queueScore);
     if (queue == nullptr)
         return;
     std::unique_lock lock(gJobMutex, std::try_to_lock);
@@ -2318,8 +2387,10 @@ void TryOwnedCaptureOnPresent()
         const auto submitTotal = gSubmits.fetch_add(1, std::memory_order_relaxed) + 1;
         if (submitTotal <= 3 || (submitTotal % 120) == 0)
         {
-            LOG_INFO("DLSS-D frame receipt={} source_frame={} owned submitted total={} tid={}",
-                     lease->tag.receiptId, lease->tag.sourceFrame, submitTotal, GetCurrentThreadId());
+            LOG_INFO("DLSS-D frame receipt={} source_frame={} owned submitted total={} queue={:p} queueScore={} "
+                     "tid={}",
+                     lease->tag.receiptId, lease->tag.sourceFrame, submitTotal, (void*) queue.Get(), queueScore,
+                     GetCurrentThreadId());
             FlushExperimentalLog();
         }
     }
