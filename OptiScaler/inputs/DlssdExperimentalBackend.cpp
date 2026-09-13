@@ -69,6 +69,8 @@ std::atomic<uint32_t> gPublished { 0 };
 std::atomic<uint32_t> gDeferredResetApplied { 0 };
 std::atomic<uint32_t> gResetCancels { 0 };
 std::atomic<uint32_t> gSubmitMismatches { 0 };
+std::atomic<uint32_t> gSubmitMatches { 0 };
+std::atomic<uint32_t> gAfterSubmitFails { 0 };
 std::mutex gFailInventoryMutex;
 struct FailEntry
 {
@@ -202,10 +204,15 @@ auto& gFrameLease = *new std::shared_ptr<FrameLease>();
 std::atomic<ID3D12GraphicsCommandList*> gReceiptProducer { nullptr };
 // Reset observed by hkReset while gJobMutex was unavailable (2026-09-12
 // EDEADLK: Record -> re-entrant Reset on the producer under stagingLock).
-// Raw pointer, never dereferenced without validation: compared against the
-// retained producer under lock, then cleared. Hook callbacks must never
-// block on gJobMutex.
-std::atomic<ID3D12GraphicsCommandList*> gDeferredResetProducer { nullptr };
+// Packed pointer | self bit in one atomic so the drainer can tell same-thread
+// re-entrancy from cross-thread pool reuse: bit0 is free (COM pointers are at
+// least 8-byte aligned). 0 means none pending. Never dereferenced without
+// validation against the retained producer under lock. Hook callbacks must
+// never block on gJobMutex.
+std::atomic<uint64_t> gDeferredReset { 0 };
+// Re-entrancy probe: nonzero while this thread holds the lease staging lock.
+// Lets Notify attribute a deferred reset to self vs another thread.
+thread_local int tStagingDepth = 0;
 uint64_t gNextReceipt = 0;
 uint64_t gPreviousOwnerFrame = 0;
 uint32_t gPreviousOwnerHandle = 0;
@@ -494,10 +501,11 @@ void ApplyProducerResetLocked(ID3D12GraphicsCommandList* list)
 // are dropped by the producer check above.
 void DrainDeferredResetLocked()
 {
-    ID3D12GraphicsCommandList* list =
-        gDeferredResetProducer.exchange(nullptr, std::memory_order_acq_rel);
-    if (list == nullptr)
+    const uint64_t packed = gDeferredReset.exchange(0, std::memory_order_acq_rel);
+    if (packed == 0)
         return;
+    auto* list = reinterpret_cast<ID3D12GraphicsCommandList*>(packed & ~uint64_t { 1 });
+    const bool self = (packed & uint64_t { 1 }) != 0;
     const bool live = gFrameLease && list == gFrameLease->producer.Get();
     const uint64_t receipt = live ? gFrameLease->tag.receiptId : 0;
     ApplyProducerResetLocked(list);
@@ -506,8 +514,8 @@ void DrainDeferredResetLocked()
         const auto total = gDeferredResetApplied.fetch_add(1, std::memory_order_relaxed) + 1;
         if (total <= 3 || (total % 120) == 0)
         {
-            LOG_INFO("DLSS-D deferred producer reset applied receipt={} total={} tid={}", receipt, total,
-                     GetCurrentThreadId());
+            LOG_INFO("DLSS-D deferred producer reset applied receipt={} total={} self={} tid={}", receipt, total,
+                     self ? 1 : 0, GetCurrentThreadId());
             FlushExperimentalLog();
         }
     }
@@ -1232,6 +1240,32 @@ bool AbortHungCreateIfTimedOut(uint32_t handleId, const AcceptedExtent* extent)
     return true;
 }
 
+// RAII holder for the lease staging section. Same early-unlock interface as
+// the unique_lock it replaces; keeps tStagingDepth balanced on all paths,
+// including exceptions escaping the sidecar calls below.
+struct StagingLock
+{
+    std::unique_lock<std::mutex> lock;
+    StagingLock()
+        : lock(gJobMutex)
+    {
+        ++tStagingDepth;
+    }
+    void unlock()
+    {
+        if (lock.owns_lock())
+        {
+            lock.unlock();
+            --tStagingDepth;
+        }
+    }
+    ~StagingLock()
+    {
+        if (lock.owns_lock())
+            --tStagingDepth;
+    }
+};
+
 Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snapshot, ID3D12Device* device,
                                    ID3D12GraphicsCommandList* commandList, const AcceptedExtent* extent)
 {
@@ -1346,7 +1380,7 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     // whose caller list has not been submitted yet. Never replace that job.
     if (!DlssdOutputHazardTrace::ReceiptsAvailable())
         return SkipUnsafe(handleId, "receipt_hooks_unavailable", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
-    std::unique_lock stagingLock(gJobMutex);
+    StagingLock stagingLock;
     DrainDeferredResetLocked();
     if (gShutdown || gHavePending || gHaveJob || gOwnerBusy.load(std::memory_order_acquire) ||
         !RetireFrameLeaseLocked())
@@ -1669,7 +1703,10 @@ void NotifyCommandListReset(ID3D12GraphicsCommandList* list)
     std::unique_lock lock(gJobMutex, std::try_to_lock);
     if (!lock.owns_lock())
     {
-        gDeferredResetProducer.store(list, std::memory_order_release);
+        // Attribute the miss: same-thread re-entrancy (the EDEADLK shape)
+        // vs another thread resetting a pooled list under our section.
+        const uint64_t packed = reinterpret_cast<uint64_t>(list) | (tStagingDepth > 0 ? uint64_t { 1 } : uint64_t { 0 });
+        gDeferredReset.store(packed, std::memory_order_release);
         return;
     }
     // A previously deferred reset for this producer is still valid; apply it
@@ -1723,6 +1760,15 @@ bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
                 }
                 return false;
             }
+            {
+                const auto total = gSubmitMatches.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (total <= 3 || (total % 120) == 0)
+                {
+                    LOG_INFO("DLSS-D frame receipt={} submission matched total={} index={} tid={}",
+                             lease->tag.receiptId, total, lease->input.ListIndex(), GetCurrentThreadId());
+                    FlushExperimentalLog();
+                }
+            }
         }
         split = Config::Instance()->FSRRDlssdPresentTranslated.value_or_default() && plan.valid &&
             !lease->copyFailed && !lease->cancelled && plan.handleId == lease->tag.handleId &&
@@ -1738,6 +1784,13 @@ bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
         std::lock_guard lock(gJobMutex);
         if (!lease->input.AfterSubmit(queue))
         {
+            const auto total = gAfterSubmitFails.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (total <= 3 || (total % 60) == 0)
+            {
+                LOG_WARN("DLSS-D frame receipt={} after-submit signal failed total={} tid={}", lease->tag.receiptId,
+                         total, GetCurrentThreadId());
+                FlushExperimentalLog();
+            }
             gRuntimePoisoned.store(true);
             lease->cancelled = true;
             lease->ownerDone = true;
