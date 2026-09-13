@@ -73,6 +73,7 @@ std::atomic<uint32_t> gSubmitMismatches { 0 };
 std::atomic<uint32_t> gSubmitMatches { 0 };
 std::atomic<uint32_t> gAfterSubmitFails { 0 };
 std::atomic<uint32_t> gNativeMatches { 0 };
+std::atomic<uint32_t> gOwnerBusyDrops { 0 };
 // SL proxy resolution for submission matching (2026-09-13): sl.dlss_d
 // forwards the NATIVE list (common::getNativeCommandBuffer) to NGX while the
 // game may submit the SL proxy, so raw pointer comparison can never hit.
@@ -304,7 +305,7 @@ struct FrameLease
     Microsoft::WRL::ComPtr<ID3D12Fence> publicationFence;
     uint32_t outputX = 0, outputY = 0, width = 0, height = 0;
     uint32_t readyState = 0;
-    bool copyFailed = false, ownerDone = false, ownerOk = false;
+    bool copyFailed = false, ownerDone = false, ownerOk = false, ownedVerified = false;
     bool split = false, cancelled = false, published = false, publicationSignalled = false;
     bool handoffActive = false;
     bool publicationCounted = false;
@@ -1062,6 +1063,17 @@ void OwnerLoop()
             bool ok = false;
             if (job.lease)
             {
+                // Owned capture proves its inputs with its own fence before
+                // handoff, so the game-list receipt wait below does not apply.
+                // The legacy pending path still uses it.
+                if (job.lease->ownedVerified)
+                {
+                    ok = !job.lease->cancelled && !job.lease->copyFailed;
+                    if (!ok)
+                        error = "owned capture invalid (copy failed or cancelled)";
+                }
+                else
+                {
                 const auto deadline = Clock::now() + std::chrono::seconds(2);
                 do
                 {
@@ -1076,6 +1088,7 @@ void OwnerLoop()
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 } while (Clock::now() < deadline);
+                }
                 if (ok)
                 {
                     std::lock_guard lock(gJobMutex);
@@ -1120,7 +1133,7 @@ void OwnerLoop()
             {
                 std::lock_guard lock(gJobMutex);
                 auto& lease = *job.lease;
-                if (ok && lease.split && !lease.cancelled)
+                if (ok && (lease.split || lease.ownedVerified) && !lease.cancelled)
                 {
                     DlssdReadyOutput ready;
                     ready.receiptId = lease.tag.receiptId;
@@ -1751,12 +1764,11 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     // Starvation diagnosis: whether the recorded identity differs from the
     // Evaluate caller determines if BeforeSubmit can ever match.
     const bool producerNormalized = lease->producer.Get() != commandList;
-    Microsoft::WRL::ComPtr<ID3D12Device> receiptDevice;
+    // Phase 2: no game-list touch at all (the NGX-time game list is never
+    // submitted, and touching it only fed the self-reset storm). The receipt
+    // stays Empty; the owned fence below is the submission proof instead.
     const char* copyError = nullptr;
-    if (lease->producer->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT ||
-        FAILED(lease->producer->GetDevice(IID_PPV_ARGS(&receiptDevice))) ||
-        !lease->input.Initialize(receiptDevice.Get(), lease->tag.receiptId) ||
-        !DlssdTranslatedSession::BeginFrameLease(lease->tag, &copyError))
+    if (!DlssdTranslatedSession::BeginFrameLease(lease->tag, &copyError))
     {
         stagingLock.unlock();
         return SkipUnsafe(handleId, "receipt_begin_failed", IdleSinceLastBoundaryMs(), snapshot.reset, extent, -1);
@@ -1808,22 +1820,18 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     if (!copied)
         LOG_WARN("DLSS-D frame receipt={} source_frame={} input_record_failed=1 reason={}",
                  lease->tag.receiptId, lease->tag.sourceFrame, copyError != nullptr ? copyError : "unknown");
-    if (!lease->input.Record(lease->producer.Get()))
-    {
-        lease->cancelled = true;
-        gRuntimePoisoned.store(true, std::memory_order_relaxed);
-        stagingLock.unlock();
-        LOG_ERROR("DLSS-D frame receipt record failed; retaining staging and HIP allocations");
-        return Decision::Rejected;
-    }
 
     {
-        // No owner handoff in phase 1: submit the owned capture instead and
-        // retire the lease next frame. The game picture stays on fallback.
+        // Phase-2 owner handoff, single-flight: the owned fence above is the
+        // submission proof, so hand the lease straight to the owner. If the
+        // owner is busy, drop this lease fail-closed and try next frame.
+        // The game picture stays on fallback; nothing publishes yet.
         const char* captureError = nullptr;
         uint64_t captureHash = 0;
         long long captureMs = 0;
-        if (ownedList != nullptr && SubmitOwnedProbe(colorResource, captureHash, captureMs, &captureError))
+        bool submitted = ownedList != nullptr &&
+            SubmitOwnedProbe(colorResource, captureHash, captureMs, &captureError);
+        if (submitted)
         {
             LOG_INFO("DLSS-D frame receipt={} source_frame={} owned_capture=1 hash={:016x} ms={}",
                      lease->tag.receiptId, lease->tag.sourceFrame, captureHash, captureMs);
@@ -1835,7 +1843,33 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
                      captureError != nullptr ? captureError : "unknown");
         }
         FlushExperimentalLog();
-        lease->cancelled = true;
+        lease->ownedVerified = submitted && copied && !lease->copyFailed;
+        if (lease->ownedVerified && !gHaveJob && !gOwnerBusy.load(std::memory_order_acquire) && !gShutdown)
+        {
+            gJob = {};
+            gJob.op = OwnerOp::Evaluate;
+            gJob.snapshot = snapshot;
+            AddRefJob(gJob, State::Instance().currentCommandQueue);
+            gJob.handleId = handleId;
+            gJob.extent = extent;
+            gJob.lease = lease;
+            gHaveJob = true;
+            gJobCv.notify_one();
+        }
+        else
+        {
+            if (lease->ownedVerified)
+            {
+                const auto total = gOwnerBusyDrops.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (total <= 3 || (total % 120) == 0)
+                {
+                    LOG_INFO("DLSS-D frame receipt={} owner busy, dropping owned lease total={} tid={}",
+                             lease->tag.receiptId, total, GetCurrentThreadId());
+                    FlushExperimentalLog();
+                }
+            }
+            lease->cancelled = true;
+        }
     }
     stagingLock.unlock();
 
