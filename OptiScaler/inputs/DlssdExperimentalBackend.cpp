@@ -1102,13 +1102,17 @@ void OwnerLoop()
                 {
                     const auto deadline = Clock::now() + std::chrono::seconds(2);
                     bool fenceOk = false;
+                    bool fenceCancelled = false;
                     for (;;)
                     {
                         {
                             std::lock_guard lock(gJobMutex);
                             auto& lease = *job.lease;
                             if (lease.cancelled)
+                            {
+                                fenceCancelled = true;
                                 break;
+                            }
                             if (lease.ownedFence &&
                                 lease.ownedFence->GetCompletedValue() >= lease.ownedFenceValue)
                             {
@@ -1122,7 +1126,11 @@ void OwnerLoop()
                     }
                     if (!fenceOk)
                     {
-                        error = "owned capture fence never completed";
+                        // A cancelled lease breaks the poll the same way a
+                        // hung GPU does; report them separately so the next
+                        // timeout storm is not misread as a fence failure.
+                        error = fenceCancelled ? "owned lease cancelled before fence completion"
+                                               : "owned capture fence never completed";
                         ok = false;
                     }
                     else
@@ -2384,6 +2392,17 @@ void TryOwnedCaptureOnPresent()
     const bool submitted = SubmitOwnedProbe(colorResource, queue.Get(), &captureError);
     if (submitted)
     {
+        // Publish the capture facts the owner polls (2026-09-13): without
+        // this the lease fence stays null and every owned job times out even
+        // though the GPU work completed. Runs under the held job mutex, so
+        // the owner's poll sees a consistent snapshot. The shared probe is
+        // safe: the next lease (and its submit) only stages after this lease
+        // reaches ownerDone, which is after the owner hashes the probe.
+        lease->ownedFence = gOwnedCapture.fence;
+        lease->ownedFenceValue = gOwnedCapture.fenceValue;
+        lease->ownedSubmitAt = Clock::now();
+        lease->ownedProbe = gOwnedCapture.probe;
+        lease->ownedProbeBytes = gOwnedCapture.probeBytes;
         const auto submitTotal = gSubmits.fetch_add(1, std::memory_order_relaxed) + 1;
         if (submitTotal <= 3 || (submitTotal % 120) == 0)
         {
