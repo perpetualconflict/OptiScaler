@@ -1970,14 +1970,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             State::Instance().NVNGX_DLSS_Path = Util::FindFilePath(exePath, "nvngx_dlss.dll");
 
         // Sidecar-private DLSS-D copy (2026-09-14): OptiScaler may stage an exact
-        // signed nvngx_dlssd.dll under OptiScaler/dlssd_runtime for translation.
-        // A staged private copy wins over ambient game copies (deterministic;
-        // immune to vendor updates swapping versions under us). It is never on
-        // any engine load path: only our code below loads it by explicit full
+        // signed nvngx_dlssd.dll under <MainDllPath>/dlssd_runtime for
+        // translation. (MainDllPath already points inside the OptiScaler
+        // companion dir, cf. the D3D12_OptiScaler probe below.) A staged
+        // private copy wins over ambient game copies (deterministic; immune
+        // to vendor updates swapping versions under us). It is never on any
+        // engine load path: only our code below loads it by explicit full
         // path, so the game and Streamline can neither see nor load it.
         {
-            const std::filesystem::path privateCopy = std::filesystem::path(optiDllPath) / L"OptiScaler" /
-                L"dlssd_runtime" / L"nvngx_dlssd.dll";
+            const std::filesystem::path privateCopy =
+                std::filesystem::path(optiDllPath) / L"dlssd_runtime" / L"nvngx_dlssd.dll";
             if (std::filesystem::exists(privateCopy) && std::filesystem::is_regular_file(privateCopy))
             {
                 State::Instance().NVNGX_DLSSD_Path = privateCopy;
