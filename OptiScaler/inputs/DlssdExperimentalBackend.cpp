@@ -146,6 +146,41 @@ bool FindProducerLocked(void* native, uint64_t currentReceipt, uint64_t& hitRece
     return false;
 }
 std::atomic<uint32_t> gLateHits { 0 };
+// Reverse lookup (2026-09-13): the producer ring never hits, so remember
+// what the game actually submits and test each new producer against it. A
+// hit means pool reuse with deep lag (fix = lifetime); permanent silence
+// means disjoint pools (fix = re-anchor). Caller holds gJobMutex.
+struct SubmittedEntry
+{
+    void* list = nullptr;
+    uint32_t evaluated = 0;
+};
+constexpr size_t kSubmittedEntries = 256;
+std::array<SubmittedEntry, kSubmittedEntries> gSubmittedRing {};
+size_t gSubmittedNext = 0;
+void RememberSubmittedLocked(ID3D12CommandList* const* lists, unsigned int count)
+{
+    const uint32_t now = gEvaluated.load(std::memory_order_relaxed);
+    for (unsigned int i = 0; i < count; ++i)
+    {
+        gSubmittedRing[gSubmittedNext] = SubmittedEntry { lists[i], now };
+        gSubmittedNext = (gSubmittedNext + 1) % kSubmittedEntries;
+    }
+}
+bool ProducerWasSubmittedLocked(void* producer, uint32_t& ageOut)
+{
+    const uint32_t now = gEvaluated.load(std::memory_order_relaxed);
+    for (const auto& entry : gSubmittedRing)
+    {
+        if (entry.list == producer && entry.evaluated != 0)
+        {
+            ageOut = now >= entry.evaluated ? now - entry.evaluated : 0;
+            return true;
+        }
+    }
+    return false;
+}
+std::atomic<uint32_t> gProducerSeenSubmitted { 0 };
 std::mutex gFailInventoryMutex;
 struct FailEntry
 {
@@ -1507,6 +1542,20 @@ Decision RunPrepareCreateThenQueue(uint32_t handleId, const InputSnapshot& snaps
     gReceiptProducer.store(lease->producer.Get(), std::memory_order_release);
     RememberProducerLocked(lease->producer.Get(), ResolveNativeForMatch(lease->producer.Get()),
                            lease->tag.receiptId);
+    {
+        uint32_t submitAge = 0;
+        if (ProducerWasSubmittedLocked(lease->producer.Get(), submitAge))
+        {
+            const auto seenTotal = gProducerSeenSubmitted.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (seenTotal <= 5 || (seenTotal % 60) == 0)
+            {
+                LOG_INFO("DLSS-D producer previously submitted receipt={} age={} total={} producer={:p} tid={}",
+                         lease->tag.receiptId, submitAge, seenTotal, (void*) lease->producer.Get(),
+                         GetCurrentThreadId());
+                FlushExperimentalLog();
+            }
+        }
+    }
     const bool copied = DlssdTranslatedSession::Evaluate(commandList, snapshot, nullptr, false, &copyError,
                                                          DlssdRuntimeFrame_CopyOnCallerList);
     // Append the receipt even after a partial copy failure: those recorded
@@ -1890,18 +1939,23 @@ bool ExecuteMatchingSubmission(ID3D12CommandQueue* queue, unsigned int count,
             D3D12_COMMAND_QUEUE_DESC queueDesc {};
             if (queue != nullptr)
                 queueDesc = queue->GetDesc();
+            RememberSubmittedLocked(lists, count);
             if (!lease->input.BeforeSubmit(queue, count, lists))
             {
                 const auto total = gSubmitMismatches.fetch_add(1, std::memory_order_relaxed) + 1;
                 if (total <= 3 || (total % 60) == 0)
                 {
+                    void* batch[6] = {};
+                    for (UINT b = 0; b < count && b < 6; ++b)
+                        batch[b] = lists[b];
                     LOG_WARN("DLSS-D frame receipt={} submission mismatch total={} phase={} matches={}/{} "
-                             "nativeMatches={}/{} lateHit={}/{} res={}/{}/{} queueType={} producer={:p} recorded={:p} "
-                             "recordedNative={:p} tid={}",
+                             "nativeMatches={}/{} lateHit={}/{} res={}/{}/{} queueType={} queue={:p} producer={:p} "
+                             "recorded={:p} recordedNative={:p} batch=[{:p},{:p},{:p},{:p},{:p},{:p}] tid={}",
                              lease->tag.receiptId, total, static_cast<int>(phase), matches, count, nativeMatches,
                              count, lateHitReceipt, lateHitAge, resChanged, resPass, resFailed,
-                             static_cast<int>(queueDesc.Type), (void*) lease->producer.Get(),
-                             (void*) recorded, recordedNative, GetCurrentThreadId());
+                             static_cast<int>(queueDesc.Type), (void*) queue, (void*) lease->producer.Get(),
+                             (void*) recorded, recordedNative, batch[0], batch[1], batch[2], batch[3], batch[4],
+                             batch[5], GetCurrentThreadId());
                     FlushExperimentalLog();
                 }
                 return false;
